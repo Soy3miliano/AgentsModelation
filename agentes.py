@@ -2,7 +2,7 @@ import mesa
 
 ESTATUS_EN_PROCESO = (
     "PENDING_ENTRANCE", "PENDING_VERIFICATION", "PENDING_VOTE",
-    "VOTING", "VOTED", "PENDING_BALLOT", "PENDING_EXIT",
+    "VOTING", "VOTED", "PENDING_BALLOT", "PENDING_EXIT", "EXITING",
 )
 
 
@@ -28,6 +28,7 @@ class ModeloCasilla(mesa.Model):
     ):
         super().__init__(rng=rng)
         self.num_agentes = n
+        self.num_funcionarios = num_funcionarios
         self.tick = 0
         self.board_size = board_size
 
@@ -50,10 +51,10 @@ class ModeloCasilla(mesa.Model):
 
         #Posicion 0 es al inicio
         self.entrance_queue = []
-        self.entrance_queue_capacity = board_size
+        self.entrance_queue_capacity = max(1, board_size - 2)
 
         self.id_queue = []
-        self.id_queue_capacity = 5
+        self.id_queue_capacity = 4
 
         self.booth_queue = []
         self.booth_queue_capacity = 5
@@ -76,29 +77,43 @@ class ModeloCasilla(mesa.Model):
         self.funcionarios = AgenteFuncionario.create_agents(model=self, n=num_funcionarios)
         self.presidente = AgentePresidente.create_agents(model=self, n=1)[0]
 
-        for i, funcionario in enumerate(self.funcionarios):
-            pos = (min(self.board_size - 1, self.board_size - 1), 2 + i)
-            self.grid.place_agent(funcionario, pos)
-
-        self.grid.place_agent(self.presidente, (self.board_size - 1, self.board_size - 1))
+        self._colocar_agentes_fijos()
 
 
     def _definir_zonas(self):
-        """Define en que fila del tablero vive cada etapa del proceso, y
-        calcula las coordenadas disponibles para cada agente segun su
-        posicion dentro de la cola correspondiente."""
+        """Define las coordenadas fijas de cada etapa del proceso siguiendo un
+        recorrido en 'U': entrada y salida comparten la pared inferior, se sube
+        por la columna izquierda, se cruza la fila superior (id/booth), se pasa
+        por el centro (mamparas/urna) y se baja por la columna derecha hacia la
+        salida. Las esquinas de la fila superior quedan reservadas para el o
+        los funcionarios (izquierda) y el presidente de casilla (derecha), asi
+        que nunca compiten por celda con una cola de votantes."""
         w = self.board_size
+        n_func = self.num_funcionarios
 
-        def fila(y, capacidad, x_inicio=0):
-            return [(x_inicio + i, y) for i in range(capacidad)]
+        self.puerta_entrada = (0, w - 1)
+        self.puerta_salida = (w - 1, w - 1)
+
+        entrance_coords = [(0, y) for y in range(1, w - 1)][: self.entrance_queue_capacity]
+        exit_coords = [(w - 1, y) for y in range(1, w - 1)][: self.exit_queue_capacity]
+
+        inicio_fila = n_func
+        fin_fila = w - 1  # exclusivo: x=w-1 es la celda del presidente
+
+        id_coords = [(x, 0) for x in range(inicio_fila, min(fin_fila, inicio_fila + self.id_queue_capacity))]
+
+        inicio_booth = inicio_fila + len(id_coords)
+        booth_fila = [(x, 0) for x in range(inicio_booth, min(fin_fila, inicio_booth + self.booth_queue_capacity))]
+        faltan_booth = self.booth_queue_capacity - len(booth_fila)
+        booth_doblez = [(fin_fila - 1, y) for y in range(1, 1 + max(0, faltan_booth))]
 
         self.zone_coords = {
-            "entrance_queue": fila(0, self.entrance_queue_capacity),
-            "id_queue": fila(2, self.id_queue_capacity),
-            "booth_queue": fila(4, self.booth_queue_capacity),
-            "voting_booth": self._posiciones_centradas(6, self.voting_booth_capacity, w),
-            "ballot_queue": fila(8, self.ballot_queue_capacity),
-            "exit_queue": fila(9, self.exit_queue_capacity, x_inicio=max(0, w - self.exit_queue_capacity)),
+            "entrance_queue": entrance_coords,
+            "id_queue": id_coords,
+            "booth_queue": booth_fila + booth_doblez,
+            "voting_booth": self._posiciones_centradas(2, self.voting_booth_capacity, w),
+            "ballot_queue": self._posiciones_centradas(5, self.ballot_queue_capacity, w),
+            "exit_queue": exit_coords,
         }
 
     @staticmethod
@@ -107,16 +122,26 @@ class ModeloCasilla(mesa.Model):
         espacio = ancho_tablero / (cantidad + 1)
         return [(round(espacio * (i + 1)), y) for i in range(cantidad)]
 
+    def _colocar_agentes_fijos(self):
+        """Coloca al/los funcionario(s) y al presidente en sus celdas fijas de
+        la fila superior (esquina izquierda y derecha respectivamente)."""
+        for i, funcionario in enumerate(self.funcionarios):
+            self.grid.place_agent(funcionario, (i, 0))
+
+        self.grid.place_agent(self.presidente, (self.board_size - 1, 0))
+
     def elementos_fijos(self):
         """Puntos fijos del escenario (no cambian) para que Unity pueda colocar
-        props una sola vez: puerta de entrada, modulo de credenciales, mamparas,
-        urna y puerta de salida."""
+        props una sola vez: puertas, modulo de credenciales, mamparas, urna,
+        funcionario(s) y presidente."""
         return {
-            "puerta_entrada": (self.board_size // 2, 0),
+            "puerta_entrada": self.puerta_entrada,
+            "puerta_salida": self.puerta_salida,
             "modulo_id": self.zone_coords["id_queue"][0],
             "mamparas": self.zone_coords["voting_booth"],
-            "urna": (self.board_size // 2, 8),
-            "puerta_salida": (self.board_size // 2, self.board_size - 1),
+            "urna": self.zone_coords["ballot_queue"][0],
+            "funcionarios": [f.pos for f in self.funcionarios],
+            "presidente": self.presidente.pos,
         }
 
     def schedule_event(self, callback, after=0):
@@ -138,6 +163,9 @@ class ModeloCasilla(mesa.Model):
         if isinstance(agente, AgentePresidente):
             return agente.pos  # posicion fija
 
+        if agente.status == "EXITING":
+            return self.puerta_salida
+
         status_a_cola = {
             "PENDING_ENTRANCE": ("entrance_queue", self.entrance_queue),
             "PENDING_VERIFICATION": ("id_queue", self.id_queue),
@@ -158,21 +186,92 @@ class ModeloCasilla(mesa.Model):
 
         return None
 
-    def _actualizar_posiciones(self):
-        """Sincroniza la posicion de cada votante en el grid de Mesa con su
-        estatus logico actual. Se hace en dos pasadas para nunca dejar a dos
-        agentes compitiendo por la misma celda en SingleGrid."""
+    def _mover_votantes_un_paso(self):
+        """Avanza a cada votante activo una celda hacia su objetivo (o lo hace
+        aparecer en la puerta de entrada si es su primera vez en el tablero),
+        resolviendo los conflictos de celda de forma centralizada -reserva de
+        celda por tick- para que nunca dos agentes intenten ocupar la misma
+        celda ni se crucen (swap) en el mismo tick."""
 
-        votantes = [a for a in self.agents if isinstance(a, AgenteVotante)]
+        votantes = [
+            a for a in self.agents
+            if isinstance(a, AgenteVotante) and a.status not in ("INACTIVE", "NO_VOTO", "DONE")
+        ]
 
-        for votante in votantes:
-            if votante.pos is not None:
-                self.grid.remove_agent(votante)
+        ocupante_por_celda = {v.pos: v for v in votantes if v.pos is not None}
 
-        for votante in votantes:
-            nueva_pos = self.get_agent_position(votante)
-            if nueva_pos is not None:
-                self.grid.place_agent(votante, nueva_pos)
+        deseos = {}
+        for v in votantes:
+            if v.pos is None:
+                deseos[v] = self.puerta_entrada
+                continue
+
+            objetivo = self.get_agent_position(v)
+            if objetivo is None or objetivo == v.pos:
+                continue
+
+            dx = (objetivo[0] > v.pos[0]) - (objetivo[0] < v.pos[0])
+            dy = (objetivo[1] > v.pos[1]) - (objetivo[1] < v.pos[1])
+            deseos[v] = (v.pos[0] + dx, v.pos[1] + dy)
+
+        orden = sorted(deseos, key=lambda a: a.unique_id)
+        reservadas = {self.presidente.pos} | {f.pos for f in self.funcionarios}
+        resuelto = {}
+
+        cambio = True
+        while cambio:
+            cambio = False
+            for v in orden:
+                if v in resuelto:
+                    continue
+
+                destino = deseos[v]
+
+                if destino in reservadas:
+                    resuelto[v] = False
+                    cambio = True
+                    continue
+
+                ocupante = ocupante_por_celda.get(destino)
+
+                if ocupante is None:
+                    resuelto[v] = True
+                    reservadas.add(destino)
+                    cambio = True
+                elif ocupante not in deseos:
+                    # el ocupante de esa celda no se mueve este tick: hay que esperar
+                    resuelto[v] = False
+                    cambio = True
+                elif ocupante in resuelto:
+                    if resuelto[ocupante] and deseos[ocupante] != v.pos:
+                        resuelto[v] = True
+                        reservadas.add(destino)
+                    else:
+                        resuelto[v] = False
+                    cambio = True
+                # si el ocupante todavia no se resuelve, se reintenta en la siguiente pasada
+
+        for v in orden:
+            resuelto.setdefault(v, False)  # ciclos/bloqueos residuales: todos quietos este tick
+
+        # Se aplica en dos fases (quitar del grid a todos los que se mueven y
+        # luego colocarlos) para que nunca importe el orden entre agentes: si
+        # se hiciera en una sola pasada, un agente podria intentar ocupar la
+        # celda de otro que, por orden de unique_id, todavia no se ha movido.
+        moventes = [v for v in orden if resuelto[v]]
+
+        for v in moventes:
+            if v.pos is not None:
+                self.grid.remove_agent(v)
+
+        for v in moventes:
+            destino = deseos[v]
+            self.grid.place_agent(v, destino)
+
+            if v.status == "EXITING" and destino == self.puerta_salida:
+                v.status = "DONE"
+                self.grid.remove_agent(v)
+                print(f"Agente: {v.unique_id}, sali de la casilla en el tiempo: {self.tick}")
 
     def step(self):
         self.process_events()
@@ -180,7 +279,7 @@ class ModeloCasilla(mesa.Model):
         print("Time: ", self.tick)
 
         self.agents.shuffle_do("step")
-        self._actualizar_posiciones()
+        self._mover_votantes_un_paso()
 
         print("Fila de Entrada:", [a.unique_id for a in self.entrance_queue])
         print("Fila de ID:", [a.unique_id for a in self.id_queue])
@@ -269,7 +368,7 @@ class AgenteVotante(mesa.Agent):
         }
 
     def step(self):
-        if self.status in ("VOTING", "DONE", "NO_VOTO"):
+        if self.status in ("VOTING", "DONE", "NO_VOTO", "EXITING"):
             return
 
         entrance_queue, id_queue, booth_queue, ballot_queue, exit_queue = (
@@ -341,8 +440,7 @@ class AgenteVotante(mesa.Agent):
 
         elif self.status == "PENDING_EXIT":
             if not exit_queue or exit_queue[0] is self:
-                self.change_queue(new_status="DONE", old_queue=exit_queue)
-                print(f"Agente: {self.unique_id}, sali de la casilla en el tiempo: {self.model.tick}")
+                self.change_queue(new_status="EXITING", old_queue=exit_queue)
 
         else:
             print(f"Estatus Indefinido: {self.status}")
