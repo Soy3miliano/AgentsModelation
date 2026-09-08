@@ -64,7 +64,7 @@ class ModeloCasilla(mesa.Model):
         self.ingreso_sigma = ingreso_sigma
         self.ideologia_sigma = ideologia_sigma
 
-        self.candidatos = candidatos or ["Candidato A", "Candidato B", "Candidato C"]
+        self.candidatos = candidatos or ["Movimiento Ciudadano", "MORENA", "PAN-PRI"]
         self.beta = np.array(beta) if beta is not None else self._beta_por_defecto()
         self.resultados = {c: 0 for c in self.candidatos}
         self.votos_emitidos = 0
@@ -95,15 +95,25 @@ class ModeloCasilla(mesa.Model):
     def _beta_por_defecto(self):
         """Matriz beta (K x 5) por defecto: una fila por candidato, columnas
         [intercepto, edad_norm, educacion_norm, ingreso_norm, ideologia].
-        Es una 'plataforma' ilustrativa (no calibrada con datos reales) pensada
-        para los 3 candidatos default. Ver knowledge-base/ para la
-        justificacion completa de estos valores."""
+
+        Calibrada al contexto real de la casilla simulada (Seccion 1250,
+        Distrito Electoral Federal 09 de Jalisco, Col. Oblatos,
+        Guadalajara) para los 3 bloques politicos que compiten ahi:
+        Movimiento Ciudadano (fuerza dominante en la Zona Metropolitana
+        de Guadalajara), MORENA (base amplia y de menor ingreso, con
+        ventaja estructural adicional en una colonia popular como
+        Oblatos) y PAN-PRI (debilitado en Jalisco frente a su fuerza
+        nacional). Es una lectura razonada del contexto real, NO datos
+        de encuesta oficiales de la seccion 1250 (no existen a ese
+        nivel de granularidad). Ver
+        ../REPORTE-CONTRADICCIONES-MODELO-SIMULACION.md y
+        MODELO_DECISION_VOTO.md para la justificacion completa."""
         num_features = 5
         if len(self.candidatos) == 3:
             return np.array([
-                [0.0,  0.4, -0.1,  0.5,  1.0],   # perfil "derecha": mayores, ingreso alto, ideologia derecha
-                [0.0, -0.3,  0.3, -0.4, -1.0],   # perfil "izquierda": jovenes, mas educacion, ideologia izquierda
-                [0.0,  0.0,  0.0,  0.0,  0.0],   # perfil "centro": no reacciona a ninguna caracteristica
+                [ 0.3, -0.1,  0.3,  0.4,  0.1],   # Movimiento Ciudadano: base urbana/clase media, no definido en el eje izq-der
+                [ 0.5,  0.1, -0.2, -0.5, -0.9],   # MORENA: base amplia de menor ingreso, ventaja estructural en Oblatos
+                [-0.4,  0.5, -0.1,  0.4,  1.0],   # PAN-PRI: mayor edad/ingreso, ideologia derecha, debilitado en Jalisco
             ])
         print(
             f"Aviso: no hay beta por defecto para {len(self.candidatos)} candidatos; "

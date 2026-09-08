@@ -17,7 +17,7 @@ config_default = {
     "voting_shape": 4.0,           
     "voting_scale": 1.25,  
     "num_funcionarios": 1,
-    "candidatos": ["Candidato A", "Candidato B", "Candidato C"],
+    "candidatos": ["Movimiento Ciudadano", "MORENA", "PAN-PRI"],
 }
 
 casilla = ModeloCasilla(**config_default)
