@@ -1,4 +1,5 @@
 import mesa
+import numpy as np
 
 ESTATUS_EN_PROCESO = (
     "PENDING_ENTRANCE", "PENDING_VERIFICATION", "PENDING_VOTE",
@@ -17,14 +18,19 @@ class ModeloCasilla(mesa.Model):
         candidatos=None,
         rng=None,
         
-        tasa_llegada=0.05,        
-        edad_media=45,             
-        edad_sigma=15,             
-        prob_genero_m=0.5,         
-        review_time_medio=3,      
-        voting_shape=4.0,          
-        voting_scale=1.25,       
-        prob_candidatos=None,     
+        tasa_llegada=0.05,
+        edad_media=45,
+        edad_sigma=15,
+        prob_genero_m=0.5,
+        review_time_medio=3,
+        voting_shape=4.0,
+        voting_scale=1.25,
+
+        prob_educacion=None,
+        ingreso_media=8000.0,
+        ingreso_sigma=3000.0,
+        ideologia_sigma=1.0,
+        beta=None,
     ):
         super().__init__(rng=rng)
         self.num_agentes = n
@@ -44,8 +50,22 @@ class ModeloCasilla(mesa.Model):
         self.voting_shape = voting_shape
         self.voting_scale = voting_scale
 
+        # Distribucion de educacion (ordinal: 0=basica, 1=media, 2=universidad, 3=posgrado).
+        # Se guarda la media/sigma teoricas de esta distribucion para poder normalizar
+        # el atributo de cada agente igual que se hace con la edad.
+        self.prob_educacion = prob_educacion or [0.25, 0.35, 0.30, 0.10]
+        niveles_educacion = [0, 1, 2, 3]
+        self.educacion_media = sum(n * p for n, p in zip(niveles_educacion, self.prob_educacion))
+        self.educacion_sigma = (
+            sum(p * (n - self.educacion_media) ** 2 for n, p in zip(niveles_educacion, self.prob_educacion)) ** 0.5
+        )
+
+        self.ingreso_media = ingreso_media
+        self.ingreso_sigma = ingreso_sigma
+        self.ideologia_sigma = ideologia_sigma
+
         self.candidatos = candidatos or ["Candidato A", "Candidato B", "Candidato C"]
-        self.prob_candidatos = prob_candidatos or [1 / len(self.candidatos)] * len(self.candidatos)
+        self.beta = np.array(beta) if beta is not None else self._beta_por_defecto()
         self.resultados = {c: 0 for c in self.candidatos}
         self.votos_emitidos = 0
 
@@ -72,6 +92,24 @@ class ModeloCasilla(mesa.Model):
 
         self._colocar_agentes_fijos()
 
+    def _beta_por_defecto(self):
+        """Matriz beta (K x 5) por defecto: una fila por candidato, columnas
+        [intercepto, edad_norm, educacion_norm, ingreso_norm, ideologia].
+        Es una 'plataforma' ilustrativa (no calibrada con datos reales) pensada
+        para los 3 candidatos default. Ver knowledge-base/ para la
+        justificacion completa de estos valores."""
+        num_features = 5
+        if len(self.candidatos) == 3:
+            return np.array([
+                [0.0,  0.4, -0.1,  0.5,  1.0],   # perfil "derecha": mayores, ingreso alto, ideologia derecha
+                [0.0, -0.3,  0.3, -0.4, -1.0],   # perfil "izquierda": jovenes, mas educacion, ideologia izquierda
+                [0.0,  0.0,  0.0,  0.0,  0.0],   # perfil "centro": no reacciona a ninguna caracteristica
+            ])
+        print(
+            f"Aviso: no hay beta por defecto para {len(self.candidatos)} candidatos; "
+            "usando perfiles neutros (voto uniforme por diseno). Pase `beta` explicitamente."
+        )
+        return np.zeros((len(self.candidatos), num_features))
 
     def _definir_zonas(self):
         w = self.board_size
@@ -299,6 +337,17 @@ class AgenteVotante(mesa.Agent):
                 break
 
         self.genero = "M" if rng.random() < self.model.prob_genero_m else "F"
+
+        self.educacion = int(rng.choice([0, 1, 2, 3], p=self.model.prob_educacion))
+
+        while True:
+            ingreso = rng.normal(self.model.ingreso_media, self.model.ingreso_sigma)
+            if ingreso >= 0:
+                self.ingreso = ingreso
+                break
+
+        self.ideologia = rng.normal(0, self.model.ideologia_sigma)
+
         self.en_revision = False
         self.revisado = False
         self.voto = None
@@ -317,8 +366,29 @@ class AgenteVotante(mesa.Agent):
 
         self.status = new_status
 
+    def vector_caracteristicas(self):
+        """Vector z_i = [1, edad_norm, educacion_norm, ingreso_norm, ideologia]
+        usado por el modelo de utilidad U_ij = beta_j^T z_i. Las variables
+        continuas se normalizan (z-score) con la media/sigma de su
+        distribucion en el modelo, igual que ya se hacia con la edad."""
+        m = self.model
+        edad_norm = (self.edad - m.edad_media) / m.edad_sigma
+        educacion_norm = (self.educacion - m.educacion_media) / m.educacion_sigma
+        ingreso_norm = (self.ingreso - m.ingreso_media) / m.ingreso_sigma
+        return np.array([1.0, edad_norm, educacion_norm, ingreso_norm, self.ideologia])
+
     def handle_voting(self):
-        self.voto = str(self.model.rng.choice(self.model.candidatos, p=self.model.prob_candidatos))
+        # Utilidad determinista por candidato: U_j = beta_j^T z_i
+        utilidades = self.model.beta @ self.vector_caracteristicas()
+
+        # Softmax (resultado de asumir ruido Gumbel en U_ij = beta_j^T z_i + eps_ij):
+        # P(X_i = j) = exp(U_j) / sum_l exp(U_l). Restar el maximo antes de exp()
+        # evita overflow numerico sin cambiar el resultado.
+        utilidades = utilidades - utilidades.max()
+        exp_u = np.exp(utilidades)
+        probs = exp_u / exp_u.sum()
+
+        self.voto = str(self.model.rng.choice(self.model.candidatos, p=probs))
         self.model.resultados[self.voto] += 1
         self.model.votos_emitidos += 1
         self.status = "VOTED"
@@ -334,6 +404,9 @@ class AgenteVotante(mesa.Agent):
             "status": self.status,
             "edad": self.edad,
             "genero": self.genero,
+            "educacion": self.educacion,
+            "ingreso": round(self.ingreso, 2),
+            "ideologia": round(self.ideologia, 3),
             "x": x,
             "y": y,
         }
