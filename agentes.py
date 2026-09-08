@@ -49,25 +49,18 @@ class ModeloCasilla(mesa.Model):
         self.resultados = {c: 0 for c in self.candidatos}
         self.votos_emitidos = 0
 
-        #Posicion 0 es al inicio
         self.entrance_queue = []
         self.entrance_queue_capacity = max(1, board_size - 2)
-
         self.id_queue = []
         self.id_queue_capacity = 4
-
         self.booth_queue = []
         self.booth_queue_capacity = 5
-
         self.voting_booth = []
         self.voting_booth_capacity = voting_booth_capacity
-
         self.ballot_queue = []
         self.ballot_queue_capacity = 5
-
         self.exit_queue = []
         self.exit_queue_capacity = 5
-
         self.event_queue = []
 
         self.grid = mesa.space.SingleGrid(board_size, board_size, torus=False)
@@ -81,59 +74,40 @@ class ModeloCasilla(mesa.Model):
 
 
     def _definir_zonas(self):
-        """Define las coordenadas fijas de cada etapa del proceso siguiendo un
-        recorrido en 'U': entrada y salida comparten la pared inferior, se sube
-        por la columna izquierda, se cruza la fila superior (id/booth), se pasa
-        por el centro (mamparas/urna) y se baja por la columna derecha hacia la
-        salida. Las esquinas de la fila superior quedan reservadas para el o
-        los funcionarios (izquierda) y el presidente de casilla (derecha), asi
-        que nunca compiten por celda con una cola de votantes."""
         w = self.board_size
-        n_func = self.num_funcionarios
+        self.puerta_entrada = (0, 9)
+        self.puerta_salida = (9, 9)
 
-        self.puerta_entrada = (0, w - 1)
-        self.puerta_salida = (w - 1, w - 1)
-
-        entrance_coords = [(0, y) for y in range(1, w - 1)][: self.entrance_queue_capacity]
-        exit_coords = [(w - 1, y) for y in range(1, w - 1)][: self.exit_queue_capacity]
-
-        inicio_fila = n_func
-        fin_fila = w - 1  # exclusivo: x=w-1 es la celda del presidente
-
-        id_coords = [(x, 0) for x in range(inicio_fila, min(fin_fila, inicio_fila + self.id_queue_capacity))]
-
-        inicio_booth = inicio_fila + len(id_coords)
-        booth_fila = [(x, 0) for x in range(inicio_booth, min(fin_fila, inicio_booth + self.booth_queue_capacity))]
-        faltan_booth = self.booth_queue_capacity - len(booth_fila)
-        booth_doblez = [(fin_fila - 1, y) for y in range(1, 1 + max(0, faltan_booth))]
-
+        # Mapeo físico estricto sin diagonales cruzadas
         self.zone_coords = {
-            "entrance_queue": entrance_coords,
-            "id_queue": id_coords,
-            "booth_queue": booth_fila + booth_doblez,
-            "voting_booth": self._posiciones_centradas(2, self.voting_booth_capacity, w),
-            "ballot_queue": self._posiciones_centradas(5, self.ballot_queue_capacity, w),
-            "exit_queue": exit_coords,
+            "entrance_queue": [(0, y) for y in range(5, 9)], 
+            "id_queue": [(0, y) for y in range(1, 5)],       
+            "booth_queue": [(5, y) for y in range(8, 3, -1)], 
+            "voting_booth": [(5, 9)],                         
+            "ballot_queue": [(2, y) for y in range(0, 5)],    
+            "exit_queue": [(9, y) for y in range(8, 3, -1)],  
         }
+
+        self.entrance_queue_capacity = len(self.zone_coords["entrance_queue"])
+        self.id_queue_capacity = len(self.zone_coords["id_queue"])
+        self.booth_queue_capacity = len(self.zone_coords["booth_queue"])
+        self.voting_booth_capacity = len(self.zone_coords["voting_booth"])
+        self.ballot_queue_capacity = len(self.zone_coords["ballot_queue"])
+        self.exit_queue_capacity = len(self.zone_coords["exit_queue"])
 
     @staticmethod
     def _posiciones_centradas(y, cantidad, ancho_tablero):
-        """Reparte 'cantidad' posiciones (ej. mamparas de votacion) centradas en el ancho del tablero."""
         espacio = ancho_tablero / (cantidad + 1)
         return [(round(espacio * (i + 1)), y) for i in range(cantidad)]
 
     def _colocar_agentes_fijos(self):
-        """Coloca al/los funcionario(s) y al presidente en sus celdas fijas de
-        la fila superior (esquina izquierda y derecha respectivamente)."""
         for i, funcionario in enumerate(self.funcionarios):
             self.grid.place_agent(funcionario, (i, 0))
 
-        self.grid.place_agent(self.presidente, (self.board_size - 1, 0))
+        pos_presi = (len(self.funcionarios), 0)
+        self.grid.place_agent(self.presidente, pos_presi)
 
     def elementos_fijos(self):
-        """Puntos fijos del escenario (no cambian) para que Unity pueda colocar
-        props una sola vez: puertas, modulo de credenciales, mamparas, urna,
-        funcionario(s) y presidente."""
         return {
             "puerta_entrada": self.puerta_entrada,
             "puerta_salida": self.puerta_salida,
@@ -154,15 +128,8 @@ class ModeloCasilla(mesa.Model):
             callback()
 
     def get_agent_position(self, agente):
-        """Calcula la posicion (x, y) que le corresponde a un agente segun su
-        estatus actual y su lugar dentro de la cola correspondiente.
-        Regresa None si el agente no debe estar presente en el tablero."""
-
-        if isinstance(agente, AgenteFuncionario):
-            return agente.pos  # posicion fija, ya se coloco en __init__
-        if isinstance(agente, AgentePresidente):
-            return agente.pos  # posicion fija
-
+        if isinstance(agente, AgenteFuncionario) or isinstance(agente, AgentePresidente):
+            return agente.pos
         if agente.status == "EXITING":
             return self.puerta_salida
 
@@ -179,25 +146,19 @@ class ModeloCasilla(mesa.Model):
         if agente.status in status_a_cola:
             zona, cola = status_a_cola[agente.status]
             coords = self.zone_coords[zona]
-            if agente in cola:
-                idx = cola.index(agente)
-                return coords[idx % len(coords)]
-            return coords[0]
-
+            
+            if zona == "voting_booth":
+                if agente in cola:
+                    idx = cola.index(agente)
+                    return coords[idx % len(coords)]
+                return coords[0]
+            else:
+                return coords[0] 
+                
         return None
 
     def _mover_votantes_un_paso(self):
-        """Avanza a cada votante activo una celda hacia su objetivo (o lo hace
-        aparecer en la puerta de entrada si es su primera vez en el tablero),
-        resolviendo los conflictos de celda de forma centralizada -reserva de
-        celda por tick- para que nunca dos agentes intenten ocupar la misma
-        celda ni se crucen (swap) en el mismo tick."""
-
-        votantes = [
-            a for a in self.agents
-            if isinstance(a, AgenteVotante) and a.status not in ("INACTIVE", "NO_VOTO", "DONE")
-        ]
-
+        votantes = [a for a in self.agents if isinstance(a, AgenteVotante) and a.status not in ("INACTIVE", "NO_VOTO", "DONE")]
         ocupante_por_celda = {v.pos: v for v in votantes if v.pos is not None}
 
         deseos = {}
@@ -239,7 +200,6 @@ class ModeloCasilla(mesa.Model):
                     reservadas.add(destino)
                     cambio = True
                 elif ocupante not in deseos:
-                    # el ocupante de esa celda no se mueve este tick: hay que esperar
                     resuelto[v] = False
                     cambio = True
                 elif ocupante in resuelto:
@@ -249,17 +209,43 @@ class ModeloCasilla(mesa.Model):
                     else:
                         resuelto[v] = False
                     cambio = True
-                # si el ocupante todavia no se resuelve, se reintenta en la siguiente pasada
 
         for v in orden:
-            resuelto.setdefault(v, False)  # ciclos/bloqueos residuales: todos quietos este tick
+            resuelto.setdefault(v, False) 
 
-        # Se aplica en dos fases (quitar del grid a todos los que se mueven y
-        # luego colocarlos) para que nunca importe el orden entre agentes: si
-        # se hiciera en una sola pasada, un agente podria intentar ocupar la
-        # celda de otro que, por orden de unique_id, todavia no se ha movido.
+        # Detección de Deadlocks
+        pendientes = [v for v in orden if not resuelto[v]]
+        visitados_globales = set()
+        for v in pendientes:
+            if v in visitados_globales: continue
+            cadena = []
+            actual = v
+            while actual not in cadena and actual in pendientes:
+                cadena.append(actual)
+                destino = deseos[actual]
+                ocupante = ocupante_por_celda.get(destino)
+                if ocupante and not resuelto.get(ocupante, False):
+                    actual = ocupante
+                else: break
+            if actual in cadena:
+                idx = cadena.index(actual)
+                ciclo = cadena[idx:]
+                es_valido = True
+                for i, nodo in enumerate(ciclo):
+                    siguiente = ciclo[(i + 1) % len(ciclo)]
+                    if deseos[nodo] != siguiente.pos:
+                        es_valido = False
+                        break
+                if es_valido:
+                    for nodo in ciclo:
+                        resuelto[nodo] = True
+                        reservadas.add(deseos[nodo])
+                        visitados_globales.add(nodo)
+            for nodo in cadena:
+                visitados_globales.add(nodo)
+
+
         moventes = [v for v in orden if resuelto[v]]
-
         for v in moventes:
             if v.pos is not None:
                 self.grid.remove_agent(v)
@@ -267,7 +253,6 @@ class ModeloCasilla(mesa.Model):
         for v in moventes:
             destino = deseos[v]
             self.grid.place_agent(v, destino)
-
             if v.status == "EXITING" and destino == self.puerta_salida:
                 v.status = "DONE"
                 self.grid.remove_agent(v)
@@ -275,18 +260,12 @@ class ModeloCasilla(mesa.Model):
 
     def step(self):
         self.process_events()
-
         print("Time: ", self.tick)
 
         self.agents.shuffle_do("step")
         self._mover_votantes_un_paso()
 
-        print("Fila de Entrada:", [a.unique_id for a in self.entrance_queue])
-        print("Fila de ID:", [a.unique_id for a in self.id_queue])
-        print("Fila de Booth:", [a.unique_id for a in self.booth_queue])
-        print("Agentes Votando:", [a.unique_id for a in self.voting_booth])
-        print("Fila de Ballot:", [a.unique_id for a in self.ballot_queue])
-        print("Fila de Salida:", [a.unique_id for a in self.exit_queue])
+        print("Fila Entrada:", len(self.entrance_queue), "| ID:", len(self.id_queue), "| Booth:", len(self.booth_queue), "| Ballot:", len(self.ballot_queue), "| Exit:", len(self.exit_queue))
         print("Terminaron:", len(self.agents.select(lambda a: getattr(a, "status", None) == "DONE")), "/", self.num_agentes)
         print("-" * 50)
 
@@ -310,9 +289,7 @@ class AgenteVotante(mesa.Agent):
     def __init__(self, model):
         super().__init__(model)
         self.status = "INACTIVE"
-
         rng = self.model.rng
-
         self.tiempo_llegada = rng.exponential(scale=1 / self.model.tasa_llegada)
 
         while True:
@@ -322,18 +299,18 @@ class AgenteVotante(mesa.Agent):
                 break
 
         self.genero = "M" if rng.random() < self.model.prob_genero_m else "F"
-
         self.en_revision = False
         self.revisado = False
-
         self.voto = None
 
     def can_change_queue(self, old_queue, new_queue, capacity):
-        return (not old_queue) or (old_queue[0] is self and len(new_queue) < capacity)
+        # Desbloqueado: No importa si es el primero de la cola, solo si hay espacio en la siguiente
+        return len(new_queue) < capacity
 
     def change_queue(self, new_status, old_queue=None, new_queue=None):
-        if old_queue:
-            old_queue.pop(0)
+        # Desbloqueado: Se remueve a sí mismo independientemente de su posición en la lista
+        if old_queue and self in old_queue:
+            old_queue.remove(self)
 
         if new_queue is not None:
             new_queue.append(self)
@@ -341,18 +318,12 @@ class AgenteVotante(mesa.Agent):
         self.status = new_status
 
     def handle_voting(self):
-        """Se dispara cuando termina el tiempo dentro de la mampara: el
-        votante elige candidato (distribucion categorica/multinomial segun
-        las preferencias configuradas), se registra el voto (de forma
-        agregada, para simular el secreto del voto) y libera la mampara."""
         self.voto = str(self.model.rng.choice(self.model.candidatos, p=self.model.prob_candidatos))
         self.model.resultados[self.voto] += 1
         self.model.votos_emitidos += 1
         self.status = "VOTED"
 
     def calculate_voting_time(self):
-        """Tiempo dentro de la mampara: distribucion Gamma (siempre positiva,
-        asimetrica a la derecha), tipica para modelar duraciones de servicio."""
         return max(1, int(round(self.model.rng.gamma(self.model.voting_shape, self.model.voting_scale))))
 
     def to_dict(self):
@@ -366,9 +337,9 @@ class AgenteVotante(mesa.Agent):
             "x": x,
             "y": y,
         }
-
+    
     def step(self):
-        if self.status in ("VOTING", "DONE", "NO_VOTO", "EXITING"):
+        if self.status in ("DONE", "NO_VOTO", "EXITING"):
             return
 
         entrance_queue, id_queue, booth_queue, ballot_queue, exit_queue = (
@@ -389,74 +360,49 @@ class AgenteVotante(mesa.Agent):
                 self.status = "NO_VOTO"
                 return
 
-            llego_su_hora = self.model.tick >= self.tiempo_llegada
-            if llego_su_hora and len(entrance_queue) < self.model.entrance_queue_capacity:
-                print(f"Soy el agente {self.unique_id}, me active en el tiempo {self.model.tick}")
-                self.change_queue(new_status="PENDING_ENTRANCE", new_queue=entrance_queue)
+            if self.model.tick >= self.tiempo_llegada and self.can_change_queue(entrance_queue, entrance_queue, self.model.entrance_queue_capacity):
+                if self.pos is None and self.model.grid.is_cell_empty(self.model.puerta_entrada):
+                    self.model.grid.place_agent(self, self.model.puerta_entrada)
+                    self.change_queue(new_status="PENDING_ENTRANCE", old_queue=None, new_queue=entrance_queue)
 
         elif self.status == "PENDING_ENTRANCE":
             if self.can_change_queue(entrance_queue, id_queue, id_capacity):
-                self.change_queue(
-                    new_status="PENDING_VERIFICATION",
-                    old_queue=entrance_queue,
-                    new_queue=id_queue
-                )
+                self.change_queue(new_status="PENDING_VERIFICATION", old_queue=entrance_queue, new_queue=id_queue)
 
         elif self.status == "PENDING_VERIFICATION":
             if self.revisado and self.can_change_queue(id_queue, booth_queue, booth_capacity):
                 self.revisado = False
-                self.change_queue(
-                    new_status="PENDING_VOTE",
-                    old_queue=id_queue,
-                    new_queue=booth_queue
-                )
+                self.change_queue(new_status="PENDING_VOTE", old_queue=id_queue, new_queue=booth_queue)
 
         elif self.status == "PENDING_VOTE":
             if self.can_change_queue(booth_queue, voting_booth, voting_capacity):
-                self.change_queue(
-                    new_status="VOTING",
-                    old_queue=booth_queue,
-                    new_queue=voting_booth
-                )
-
+                self.change_queue(new_status="VOTING", old_queue=booth_queue, new_queue=voting_booth)
+                # Disparamos el tiempo inmediatamente al entrar a la mampara
                 wait = self.calculate_voting_time()
                 self.model.schedule_event(self.handle_voting, after=wait)
 
+        elif self.status == "VOTING":
+            # Espera a que el evento cambie su estatus a VOTED
+            pass
+
         elif self.status == "VOTED":
-            if len(ballot_queue) < ballot_capacity:
-                self.change_queue(
-                    new_status="PENDING_BALLOT",
-                    old_queue=voting_booth,
-                    new_queue=ballot_queue
-                )
+            if self.can_change_queue(voting_booth, ballot_queue, ballot_capacity):
+                self.change_queue(new_status="PENDING_BALLOT", old_queue=voting_booth, new_queue=ballot_queue)
 
         elif self.status == "PENDING_BALLOT":
+            # Pasa directamente a salida, evitando candados de urna
             if self.can_change_queue(ballot_queue, exit_queue, exit_capacity):
-                self.change_queue(
-                    new_status="PENDING_EXIT",
-                    old_queue=ballot_queue,
-                    new_queue=exit_queue
-                )
+                self.change_queue(new_status="PENDING_EXIT", old_queue=ballot_queue, new_queue=exit_queue)
 
         elif self.status == "PENDING_EXIT":
-            if not exit_queue or exit_queue[0] is self:
-                self.change_queue(new_status="EXITING", old_queue=exit_queue)
-
-        else:
-            print(f"Estatus Indefinido: {self.status}")
+            self.change_queue(new_status="EXITING", old_queue=exit_queue)
 
 
 class AgenteFuncionario(mesa.Agent):
-    """Revisa la credencial de elector de quien esta al frente de la fila de
-    identificacion. Mientras un votante esta 'en_revision', no puede avanzar
-    a la fila de mamparas hasta que termine su revision."""
-
     def __init__(self, model):
         super().__init__(model)
 
     def review_id(self, votante):
-        """El tiempo de revision sigue una distribucion Exponencial (comun
-        para modelar tiempos de servicio en teoria de colas)."""
         votante.en_revision = True
         duracion = max(1, int(round(self.model.rng.exponential(self.model.review_time_medio))))
         self.model.schedule_event(lambda: self._completar_revision(votante), after=duracion)
@@ -471,19 +417,21 @@ class AgenteFuncionario(mesa.Agent):
         return {"id": self.unique_id, "tipo": "funcionario", "x": x, "y": y}
 
     def step(self):
-        id_queue = self.model.id_queue
-        if not id_queue:
+        if not self.model.id_queue:
             return
 
-        votante = id_queue[0]
-        if not votante.en_revision and not votante.revisado:
-            self.review_id(votante)
+        # Verifica quién está físicamente en la mesa, no solo lógicamente
+        posicion_frente = self.model.zone_coords["id_queue"][0]
+        votante_frente = next((v for v in self.model.id_queue if v.pos == posicion_frente), None)
+
+        if not votante_frente:
+            return  
+
+        if not votante_frente.en_revision and not votante_frente.revisado:
+            self.review_id(votante_frente)
 
 
 class AgentePresidente(mesa.Agent):
-    """Administra la jornada: cierra la entrada al llegar la hora de cierre
-    y determina cuando la simulacion ha terminado por completo."""
-
     def __init__(self, model):
         super().__init__(model)
 
@@ -494,7 +442,7 @@ class AgentePresidente(mesa.Agent):
     def step(self):
         if self.model.casilla_abierta and self.model.tick >= self.model.hora_cierre:
             self.model.casilla_abierta = False
-            print(f"El presidente de casilla cierra la entrada en el tiempo {self.model.tick}")
+            print(f"El presidente cierra la entrada en el tiempo {self.model.tick}")
 
         if not self.model.casilla_abierta and not self.model.finalizada:
             votantes = [a for a in self.model.agents if isinstance(a, AgenteVotante)]
@@ -503,4 +451,4 @@ class AgentePresidente(mesa.Agent):
             if not quedan_pendientes:
                 self.model.finalizada = True
                 self.model.running = False
-                print(f"Jornada electoral terminada en el tiempo {self.model.tick}. Resultados: {self.model.resultados}")
+                print(f"Jornada terminada. Resultados: {self.model.resultados}")
