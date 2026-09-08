@@ -3,21 +3,35 @@ import time
 
 from flask import Flask, jsonify, request
 
+import estadistica as est
 from agentes import ModeloCasilla
 
 app = Flask(__name__)
- 
+
 
 config_default = {
-    "n": 10,
+    # Escalas alineadas al documento de fundamentacion (secciones 3.3 y 5.3):
+    # N = 625 electores en la lista nominal y jornada de 600 minutos.
+    "n": est.N_LISTA_NOMINAL,
     "board_size": 10,
-    "hora_cierre": 300,
+    "hora_cierre": est.DURACION_JORNADA,
     "voting_booth_capacity": 2,
-    "review_time_medio": 3,      
-    "voting_shape": 4.0,           
-    "voting_scale": 1.25,  
+    "review_time_medio": 3,
+    "voting_shape": 4.0,
+    "voting_scale": 1.25,
     "num_funcionarios": 1,
     "candidatos": ["Movimiento Ciudadano", "MORENA", "PAN-PRI"],
+
+    # Modelos estadisticos (ver estadistica.py y
+    # CONCEPTOS_ESTADISTICOS_IMPLEMENTADOS.md).
+    # modo_voto se deja en "utilidad" para no alterar lo que Unity ya pinta
+    # (3 bloques). Para usar el modelo Categorico + Dirichlet de 6 categorias,
+    # basta un POST a /api/simulacion/reset con {"modo_voto":
+    # "categorico_dirichlet", "escenario": "A"}.
+    "modo_voto": "utilidad",
+    "escenario": "A",
+    "perfil_llegadas": "nhpp",
+    "participacion": est.PARTICIPACION_BASE,
 }
 
 casilla = ModeloCasilla(**config_default)
@@ -110,6 +124,70 @@ def resultados():
 def resumen():
     with lock:
         return jsonify(casilla.resumen()), 200
+
+
+@app.route('/api/estadisticas', methods=['GET'])
+def estadisticas():
+    """Estadisticas para el HUD de Unity.
+
+    - `en_vivo`: lo que se muestra durante la jornada (votantes atendidos,
+      longitud de fila actual, minutos transcurridos).
+    - `final`: solo cuando la jornada termina. Trae media, desviacion e
+      intervalo de confianza al 95 % de cada variable de salida.
+
+    IMPORTANTE para quien pinte esto: es UNA corrida, no un promedio de
+    replicas. El campo `advertencia` trae el texto exacto que debe mostrarse
+    junto a los numeros para no dar una falsa idea de precision. Para IC entre
+    replicas hay que correr replicas.py.
+    """
+    with lock:
+        payload = {
+            "en_vivo": {
+                "minuto_jornada": casilla.tick,
+                "duracion_jornada": casilla.hora_cierre,
+                "votantes_atendidos": casilla.votos_emitidos,
+                "personas_formadas": casilla.personas_formadas(),
+                "longitud_max_fila": casilla.longitud_max_fila,
+                "casilla_abierta": casilla.casilla_abierta,
+                "simulacion_activa": simulacion_activa,
+            },
+            "finalizada": casilla.finalizada,
+            "modelo": {
+                "modo_voto": casilla.modo_voto,
+                "escenario": casilla.escenario,
+                "perfil_llegadas": casilla.perfil_llegadas,
+            },
+            "advertencia": "Resultado de 1 corrida, no es promedio de replicas.",
+        }
+
+        # El desglose por bloque sigue la misma regla que /api/resultados: no se
+        # revela mientras la jornada continua.
+        payload["final"] = casilla.estadisticas_corrida() if casilla.finalizada else None
+
+        return jsonify(payload), 200
+
+
+@app.route('/api/escenarios', methods=['GET'])
+def escenarios():
+    """Catalogo de escenarios y modelos disponibles, para poblar un menu en Unity."""
+    return jsonify({
+        "escenarios": {
+            clave: {
+                "nombre": datos["nombre"],
+                "descripcion": datos["descripcion"],
+                "p": datos["p"],
+                "alphas": list(est.alphas_escenario(clave)),
+            }
+            for clave, datos in est.ESCENARIOS.items()
+        },
+        "categorias_voto": est.CATEGORIAS_VOTO,
+        "modos_voto": ["utilidad", "categorico_dirichlet"],
+        "perfiles_llegada": ["nhpp", "homogeneo"],
+        "perfil_horario_nhpp": [
+            {"inicio_min": i, "fin_min": f, "tasa_por_hora": t, "franja": e}
+            for i, f, t, e in est.PERFIL_HORARIO_NHPP
+        ],
+    }), 200
 
 
 
