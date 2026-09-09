@@ -1,4 +1,7 @@
 import mesa
+import numpy as np
+
+import estadistica as est
 
 ESTATUS_EN_PROCESO = (
     "PENDING_ENTRANCE", "PENDING_VERIFICATION", "PENDING_VOTE",
@@ -11,30 +14,60 @@ class ModeloCasilla(mesa.Model):
         self,
         n,
         board_size=10,
-        hora_cierre=300,
+        hora_cierre=est.DURACION_JORNADA,
         voting_booth_capacity=2,
         num_funcionarios=1,
         candidatos=None,
         rng=None,
-        
-        tasa_llegada=0.05,        
-        edad_media=45,             
-        edad_sigma=15,             
-        prob_genero_m=0.5,         
-        review_time_medio=3,      
-        voting_shape=4.0,          
-        voting_scale=1.25,       
-        prob_candidatos=None,     
+
+        # --- Modelos estadisticos formales (ver estadistica.py) ---
+        # modo_voto: "utilidad"            -> logit multinomial con la matriz beta (original)
+        #            "categorico_dirichlet" -> MODELO A + B: p ~ Dirichlet por replica
+        #                                      y voto ~ Categorical(p) por agente
+        modo_voto="utilidad",
+        escenario="A",
+        concentracion_dirichlet=None,
+        p_replica=None,
+        # perfil_llegadas: "nhpp" (MODELO C, por defecto) u "homogeneo" (fallback simple)
+        perfil_llegadas="nhpp",
+        participacion=est.PARTICIPACION_BASE,
+        verbose=True,
+
+        tasa_llegada=0.05,
+        edad_media=45,
+        edad_sigma=15,
+        prob_genero_m=0.5,
+        review_time_medio=3,
+        voting_shape=4.0,
+        voting_scale=1.25,
+
+        prob_educacion=None,
+        ingreso_media=8000.0,
+        ingreso_sigma=3000.0,
+        ideologia_sigma=1.0,
+        beta=None,
+        prob_terremoto=0.0005,
     ):
         super().__init__(rng=rng)
         self.num_agentes = n
         self.num_funcionarios = num_funcionarios
         self.tick = 0
         self.board_size = board_size
+        self.verbose = verbose
 
         self.hora_cierre = hora_cierre     
         self.casilla_abierta = True
         self.finalizada = False
+
+        # --- Evento extraordinario (sismo) ---
+        # Probabilidad (baja) de que ocurra un sismo en cada tick. Cuando
+        # ocurre, se suspenden las votaciones y el presidente se convierte
+        # en un "faro" que lidera la evacuacion hacia la zona segura.
+        self.prob_terremoto = prob_terremoto
+        self.evento_extraordinario = False
+        self.tick_evento_extraordinario = None
+        self.zona_segura = (board_size // 2, board_size // 2)
+        self.tick_llegada_zona_segura = None
 
         self.tasa_llegada = tasa_llegada
         self.edad_media = edad_media
@@ -44,10 +77,77 @@ class ModeloCasilla(mesa.Model):
         self.voting_shape = voting_shape
         self.voting_scale = voting_scale
 
-        self.candidatos = candidatos or ["Candidato A", "Candidato B", "Candidato C"]
-        self.prob_candidatos = prob_candidatos or [1 / len(self.candidatos)] * len(self.candidatos)
+        # Distribucion de educacion (ordinal: 0=basica, 1=media, 2=universidad, 3=posgrado).
+        # Se guarda la media/sigma teoricas de esta distribucion para poder normalizar
+        # el atributo de cada agente igual que se hace con la edad.
+        self.prob_educacion = prob_educacion or [0.25, 0.35, 0.30, 0.10]
+        niveles_educacion = [0, 1, 2, 3]
+        self.educacion_media = sum(n * p for n, p in zip(niveles_educacion, self.prob_educacion))
+        self.educacion_sigma = (
+            sum(p * (n - self.educacion_media) ** 2 for n, p in zip(niveles_educacion, self.prob_educacion)) ** 0.5
+        )
+
+        self.ingreso_media = ingreso_media
+        self.ingreso_sigma = ingreso_sigma
+        self.ideologia_sigma = ideologia_sigma
+
+        # --- Configuracion del modelo de voto -------------------------------
+        # Los dos modos conviven a proposito: "utilidad" es el logit multinomial
+        # calibrado con la matriz beta y "categorico_dirichlet" es el modelo
+        # jerarquico Dirichlet-Multinomial del documento de fundamentacion.
+        self.modo_voto = modo_voto
+        self.escenario = escenario
+        self.perfil_llegadas = perfil_llegadas
+        self.participacion = participacion
+
+        if modo_voto == "categorico_dirichlet":
+            # Las categorias las fija la tabla del escenario (6 opciones,
+            # incluyendo nulo y candidatura no registrada), no el argumento
+            # `candidatos`, para que el vector p y las etiquetas no se
+            # desalineen nunca.
+            if candidatos is not None and len(candidatos) != len(est.CATEGORIAS_VOTO):
+                print(
+                    f"Aviso: modo_voto='categorico_dirichlet' usa las "
+                    f"{len(est.CATEGORIAS_VOTO)} categorias del escenario "
+                    f"'{escenario}'; se ignoran los {len(candidatos)} candidatos recibidos."
+                )
+            self.candidatos = list(est.CATEGORIAS_VOTO)
+
+            self.alphas_dirichlet = est.alphas_escenario(
+                escenario,
+                concentracion_dirichlet or est.CONCENTRACION_DIRICHLET,
+            )
+            # MODELO B: un solo sorteo de p POR REPLICA (aqui, por instancia del
+            # modelo = una corrida). Todos los votos de esta corrida usan este
+            # mismo p; la variacion entre corridas es lo que aporta la Dirichlet.
+            if p_replica is not None:
+                self.p_replica = np.asarray(p_replica, dtype=float)
+            else:
+                self.p_replica = est.muestrear_dirichlet(self.alphas_dirichlet, self.rng)
+        else:
+            self.candidatos = candidatos or ["Movimiento Ciudadano", "MORENA", "PAN-PRI"]
+            self.alphas_dirichlet = None
+            self.p_replica = None
+
+        if beta is not None:
+            self.beta = np.array(beta)
+        elif self.modo_voto == "utilidad":
+            self.beta = self._beta_por_defecto()
+        else:
+            # En modo categorico la matriz beta no se usa; no tiene sentido
+            # advertir que no hay calibracion para 6 categorias.
+            self.beta = None
+
         self.resultados = {c: 0 for c in self.candidatos}
         self.votos_emitidos = 0
+
+        # --- Metricas de salida (MODELO D) ----------------------------------
+        # Se acumulan durante la corrida para poder reportar media, desviacion
+        # e IC 95 % al final, en vez de un solo numero suelto.
+        self.tiempos_espera = []       # minutos de cola antes de entrar a la mampara
+        self.tiempos_en_sistema = []   # minutos totales dentro de la casilla
+        self.longitud_max_fila = 0
+        self.serie_longitud_fila = []
 
         self.entrance_queue = []
         self.entrance_queue_capacity = max(1, board_size - 2)
@@ -72,6 +172,34 @@ class ModeloCasilla(mesa.Model):
 
         self._colocar_agentes_fijos()
 
+    def _beta_por_defecto(self):
+        """Matriz beta (K x 5) por defecto: una fila por candidato, columnas
+        [intercepto, edad_norm, educacion_norm, ingreso_norm, ideologia].
+
+        Calibrada al contexto real de la casilla simulada (Seccion 1250,
+        Distrito Electoral Federal 09 de Jalisco, Col. Oblatos,
+        Guadalajara) para los 3 bloques politicos que compiten ahi:
+        Movimiento Ciudadano (fuerza dominante en la Zona Metropolitana
+        de Guadalajara), MORENA (base amplia y de menor ingreso, con
+        ventaja estructural adicional en una colonia popular como
+        Oblatos) y PAN-PRI (debilitado en Jalisco frente a su fuerza
+        nacional). Es una lectura razonada del contexto real, NO datos
+        de encuesta oficiales de la seccion 1250 (no existen a ese
+        nivel de granularidad). Ver
+        ../REPORTE-CONTRADICCIONES-MODELO-SIMULACION.md y
+        MODELO_DECISION_VOTO.md para la justificacion completa."""
+        num_features = 5
+        if len(self.candidatos) == 3:
+            return np.array([
+                [ 0.3, -0.1,  0.3,  0.4,  0.1],   # Movimiento Ciudadano: base urbana/clase media, no definido en el eje izq-der
+                [ 0.5,  0.1, -0.2, -0.5, -0.9],   # MORENA: base amplia de menor ingreso, ventaja estructural en Oblatos
+                [-0.4,  0.5, -0.1,  0.4,  1.0],   # PAN-PRI: mayor edad/ingreso, ideologia derecha, debilitado en Jalisco
+            ])
+        print(
+            f"Aviso: no hay beta por defecto para {len(self.candidatos)} candidatos; "
+            "usando perfiles neutros (voto uniforme por diseno). Pase `beta` explicitamente."
+        )
+        return np.zeros((len(self.candidatos), num_features))
 
     def _definir_zonas(self):
         w = self.board_size
@@ -127,9 +255,49 @@ class ModeloCasilla(mesa.Model):
         for _, callback in pendientes:
             callback()
 
+    def _chequear_evento_extraordinario(self):
+        """En cada tick, mientras no haya ocurrido ya un evento extraordinario
+        y la jornada no haya finalizado, existe una probabilidad baja
+        (self.prob_terremoto) de que ocurra un sismo. Al activarse, se
+        suspenden las votaciones: todos los agentes votantes dejan de
+        avanzar en sus tramites y el presidente lidera la evacuacion."""
+        if self.evento_extraordinario or self.finalizada:
+            return
+
+        if self.rng.random() < self.prob_terremoto:
+            self.evento_extraordinario = True
+            self.tick_evento_extraordinario = self.tick
+
+            # El sismo cierra la casilla de inmediato (ya no es una decision
+            # normal de hora de cierre, sino una emergencia).
+            self.casilla_abierta = False
+
+            # Se vacian las filas: los agentes que estaban formados dejan de
+            # estar "en cola" (cada uno pasa a EN_EVACUACION en su propio
+            # step de este mismo tick, ver AgenteVotante) y siguen al
+            # presidente en lugar de esperar su turno.
+            self.entrance_queue.clear()
+            self.id_queue.clear()
+            self.booth_queue.clear()
+            self.voting_booth.clear()
+            self.ballot_queue.clear()
+            self.exit_queue.clear()
+
+            if self.verbose:
+                print(f"¡EVENTO EXTRAORDINARIO! Sismo detectado en el tiempo {self.tick}. "
+                      f"Se cierra la casilla, se suspenden las votaciones y el presidente "
+                      f"lidera la evacuacion.")
+
     def get_agent_position(self, agente):
         if isinstance(agente, AgenteFuncionario) or isinstance(agente, AgentePresidente):
             return agente.pos
+
+        if agente.status == "EN_EVACUACION":
+            # Durante el evento extraordinario, el votante ya no se dirige a
+            # su cola habitual: sigue al presidente (el "faro") hacia la
+            # zona segura.
+            return self.presidente.pos
+
         if agente.status == "EXITING":
             return self.puerta_salida
 
@@ -256,18 +424,39 @@ class ModeloCasilla(mesa.Model):
             if v.status == "EXITING" and destino == self.puerta_salida:
                 v.status = "DONE"
                 self.grid.remove_agent(v)
-                print(f"Agente: {v.unique_id}, sali de la casilla en el tiempo: {self.tick}")
+                # MODELO D: tiempo total dentro de la casilla.
+                v.tick_salida = self.tick
+                if v.tick_entrada is not None:
+                    self.tiempos_en_sistema.append(self.tick - v.tick_entrada)
+                if self.verbose:
+                    print(f"Agente: {v.unique_id}, sali de la casilla en el tiempo: {self.tick}")
+
+    def personas_formadas(self):
+        """Total de votantes haciendo fila en este instante (todas las colas)."""
+        return (
+            len(self.entrance_queue) + len(self.id_queue) + len(self.booth_queue)
+            + len(self.ballot_queue) + len(self.exit_queue)
+        )
 
     def step(self):
         self.process_events()
-        print("Time: ", self.tick)
+        self._chequear_evento_extraordinario()
+        if self.verbose:
+            print("Time: ", self.tick)
 
         self.agents.shuffle_do("step")
         self._mover_votantes_un_paso()
 
-        print("Fila Entrada:", len(self.entrance_queue), "| ID:", len(self.id_queue), "| Booth:", len(self.booth_queue), "| Ballot:", len(self.ballot_queue), "| Exit:", len(self.exit_queue))
-        print("Terminaron:", len(self.agents.select(lambda a: getattr(a, "status", None) == "DONE")), "/", self.num_agentes)
-        print("-" * 50)
+        # MODELO D: la longitud de fila es una variable de salida, hay que
+        # registrarla en cada paso y no solo imprimirla.
+        formados = self.personas_formadas()
+        self.serie_longitud_fila.append(formados)
+        self.longitud_max_fila = max(self.longitud_max_fila, formados)
+
+        if self.verbose:
+            print("Fila Entrada:", len(self.entrance_queue), "| ID:", len(self.id_queue), "| Booth:", len(self.booth_queue), "| Ballot:", len(self.ballot_queue), "| Exit:", len(self.exit_queue))
+            print("Terminaron:", len(self.agents.select(lambda a: getattr(a, "status", None) == "DONE")), "/", self.num_agentes)
+            print("-" * 50)
 
         self.tick += 1
 
@@ -282,6 +471,49 @@ class ModeloCasilla(mesa.Model):
             "no_votaron": len([a for a in votantes if a.status == "NO_VOTO"]),
             "en_proceso": len([a for a in votantes if a.status in ESTATUS_EN_PROCESO]),
             "votos_emitidos": self.votos_emitidos,
+            # Claves nuevas (aditivas: no rompen a quien ya lee las anteriores)
+            "personas_formadas": self.personas_formadas(),
+            "longitud_max_fila": self.longitud_max_fila,
+            "modo_voto": self.modo_voto,
+            "escenario": self.escenario,
+            "perfil_llegadas": self.perfil_llegadas,
+            "evento_extraordinario": self.evento_extraordinario,
+        }
+
+    def estadisticas_corrida(self):
+        """MODELO D aplicado a UNA corrida: media, desviacion e IC 95 % de las
+        variables de salida, calculados sobre los votantes de esta corrida.
+
+        Ojo con la interpretacion: aqui la unidad de observacion es el VOTANTE
+        (cuanto espero cada persona), no la replica. Para el intervalo de
+        confianza sobre el comportamiento del SISTEMA hay que promediar entre
+        replicas: eso lo hace replicas.py.
+        """
+        proporciones = {}
+        if self.votos_emitidos > 0:
+            proporciones = {
+                c: self.resultados[c] / self.votos_emitidos for c in self.candidatos
+            }
+
+        return {
+            "corrida_unica": True,
+            "nota": (
+                "Resultado de 1 corrida. Los intervalos describen la dispersion "
+                "ENTRE VOTANTES, no entre replicas. Use replicas.py para el IC "
+                "del sistema."
+            ),
+            "tiempo_espera": est.media_desv_ic95(self.tiempos_espera),
+            "tiempo_en_sistema": est.media_desv_ic95(self.tiempos_en_sistema),
+            "longitud_fila": est.media_desv_ic95(self.serie_longitud_fila),
+            "longitud_max_fila": self.longitud_max_fila,
+            "proporcion_voto": proporciones,
+            "votos_emitidos": self.votos_emitidos,
+            "participacion_observada": (
+                self.votos_emitidos / self.num_agentes if self.num_agentes else 0.0
+            ),
+            "p_replica": (
+                list(self.p_replica) if self.p_replica is not None else None
+            ),
         }
 
 
@@ -290,7 +522,27 @@ class AgenteVotante(mesa.Agent):
         super().__init__(model)
         self.status = "INACTIVE"
         rng = self.model.rng
-        self.tiempo_llegada = rng.exponential(scale=1 / self.model.tasa_llegada)
+
+        # MODELO C: momento de llegada a la casilla.
+        # Por defecto se usa el proceso de Poisson NO homogeneo (tasa constante
+        # por tramos horarios); el proceso homogeneo queda como modo simple.
+        if self.model.perfil_llegadas == "nhpp":
+            self.tiempo_llegada = est.muestrear_tiempo_llegada_nhpp(
+                rng, duracion_jornada=self.model.hora_cierre
+            )
+        else:
+            self.tiempo_llegada = est.muestrear_tiempo_llegada_homogeneo(
+                rng, self.model.tasa_llegada
+            )
+
+        # No todos los inscritos en la lista nominal acuden: la participacion
+        # historica es del 61 % (documento de fundamentacion, seccion 7.2).
+        # Es un ensayo Bernoulli por elector.
+        self.acude_a_votar = rng.random() < self.model.participacion
+
+        # Marcas de tiempo para las metricas del MODELO D.
+        self.tick_entrada = None
+        self.tick_salida = None
 
         while True:
             edad = int(round(rng.normal(self.model.edad_media, self.model.edad_sigma)))
@@ -299,6 +551,17 @@ class AgenteVotante(mesa.Agent):
                 break
 
         self.genero = "M" if rng.random() < self.model.prob_genero_m else "F"
+
+        self.educacion = int(rng.choice([0, 1, 2, 3], p=self.model.prob_educacion))
+
+        while True:
+            ingreso = rng.normal(self.model.ingreso_media, self.model.ingreso_sigma)
+            if ingreso >= 0:
+                self.ingreso = ingreso
+                break
+
+        self.ideologia = rng.normal(0, self.model.ideologia_sigma)
+
         self.en_revision = False
         self.revisado = False
         self.voto = None
@@ -306,6 +569,16 @@ class AgenteVotante(mesa.Agent):
     def can_change_queue(self, old_queue, new_queue, capacity):
         # Desbloqueado: No importa si es el primero de la cola, solo si hay espacio en la siguiente
         return len(new_queue) < capacity
+
+    def ha_llegado(self):
+        """True si el agente ya alcanzo fisicamente la celda que le corresponde
+        para su estatus actual. Se exige antes de avanzar de cola para que el
+        estado logico no se adelante al fisico: si no, varios agentes pueden
+        "ocupar" un cupo logico de la siguiente cola sin haber llegado nunca
+        a la celda desde la que se sale, taponando el pasillo (deadlock)."""
+        if self.pos is None:
+            return False
+        return self.pos == self.model.get_agent_position(self)
 
     def change_queue(self, new_status, old_queue=None, new_queue=None):
         # Desbloqueado: Se remueve a sí mismo independientemente de su posición en la lista
@@ -317,11 +590,73 @@ class AgenteVotante(mesa.Agent):
 
         self.status = new_status
 
+    def vector_caracteristicas(self):
+        """Vector z_i = [1, edad_norm, educacion_norm, ingreso_norm, ideologia]
+        usado por el modelo de utilidad U_ij = beta_j^T z_i. Las variables
+        continuas se normalizan (z-score) con la media/sigma de su
+        distribucion en el modelo, igual que ya se hacia con la edad."""
+        m = self.model
+        edad_norm = (self.edad - m.edad_media) / m.edad_sigma
+        educacion_norm = (self.educacion - m.educacion_media) / m.educacion_sigma
+        ingreso_norm = (self.ingreso - m.ingreso_media) / m.ingreso_sigma
+        return np.array([1.0, edad_norm, educacion_norm, ingreso_norm, self.ideologia])
+
+    def probabilidades_voto(self):
+        """Vector de probabilidades p sobre las k opciones de la boleta.
+
+        De donde sale p depende del modo configurado en el modelo:
+
+        - "utilidad": logit multinomial. Cada agente tiene SU PROPIO p,
+          derivado de sus atributos via U_j = beta_j^T z_i + softmax.
+        - "categorico_dirichlet": todos los agentes de la corrida comparten el
+          mismo p, sorteado una sola vez de la Dirichlet (MODELO B).
+        """
+        if self.model.modo_voto == "categorico_dirichlet":
+            return self.model.p_replica
+
+        # Utilidad determinista por candidato: U_j = beta_j^T z_i
+        utilidades = self.model.beta @ self.vector_caracteristicas()
+
+        # Softmax (resultado de asumir ruido Gumbel en U_ij = beta_j^T z_i + eps_ij):
+        # P(X_i = j) = exp(U_j) / sum_l exp(U_l). Restar el maximo antes de exp()
+        # evita overflow numerico sin cambiar el resultado.
+        utilidades = utilidades - utilidades.max()
+        exp_u = np.exp(utilidades)
+        return exp_u / exp_u.sum()
+
     def handle_voting(self):
-        self.voto = str(self.model.rng.choice(self.model.candidatos, p=self.model.prob_candidatos))
+        if self.model.evento_extraordinario:
+            # Las votaciones estan suspendidas por el evento extraordinario:
+            # este voto (programado antes del sismo) ya no se registra.
+            return
+
+        # MODELO A: el voto es una extraccion de una distribucion categorica
+        # Categorical(p) de longitud k arbitraria (no hay k fijado en el codigo).
+        self.voto = est.muestrear_voto_categorico(
+            self.probabilidades_voto(),
+            self.model.rng,
+            etiquetas=self.model.candidatos,
+        )
         self.model.resultados[self.voto] += 1
         self.model.votos_emitidos += 1
         self.status = "VOTED"
+
+        # MODELO D: tiempo de espera en fila = desde que entro a la casilla
+        # hasta que empezo a votar en la mampara.
+        if self.tick_entrada is not None:
+            self.model.tiempos_espera.append(self.model.tick - self.tick_entrada)
+
+    def _reaccionar_a_evento_extraordinario(self):
+        """Cuando ocurre el evento extraordinario (sismo), el votante
+        suspende cualquier tramite de votacion en el que estuviera y pasa a
+        seguir al presidente de casilla -convertido en un "faro"- rumbo a
+        la zona segura. Los agentes que aun no habian entrado a la casilla,
+        o que ya terminaron/no votaron, no se ven afectados."""
+        if self.status in ("INACTIVE", "DONE", "NO_VOTO"):
+            return
+
+        self.en_revision = False
+        self.status = "EN_EVACUACION"
 
     def calculate_voting_time(self):
         return max(1, int(round(self.model.rng.gamma(self.model.voting_shape, self.model.voting_scale))))
@@ -334,11 +669,18 @@ class AgenteVotante(mesa.Agent):
             "status": self.status,
             "edad": self.edad,
             "genero": self.genero,
+            "educacion": self.educacion,
+            "ingreso": round(self.ingreso, 2),
+            "ideologia": round(self.ideologia, 3),
             "x": x,
             "y": y,
         }
     
     def step(self):
+        if self.model.evento_extraordinario:
+            self._reaccionar_a_evento_extraordinario()
+            return
+
         if self.status in ("DONE", "NO_VOTO", "EXITING"):
             return
 
@@ -356,6 +698,11 @@ class AgenteVotante(mesa.Agent):
         voting_booth = self.model.voting_booth
 
         if self.status == "INACTIVE":
+            # Abstencion: el elector estaba en la lista nominal pero no acude.
+            if not self.acude_a_votar:
+                self.status = "NO_VOTO"
+                return
+
             if not self.model.casilla_abierta:
                 self.status = "NO_VOTO"
                 return
@@ -363,19 +710,20 @@ class AgenteVotante(mesa.Agent):
             if self.model.tick >= self.tiempo_llegada and self.can_change_queue(entrance_queue, entrance_queue, self.model.entrance_queue_capacity):
                 if self.pos is None and self.model.grid.is_cell_empty(self.model.puerta_entrada):
                     self.model.grid.place_agent(self, self.model.puerta_entrada)
+                    self.tick_entrada = self.model.tick
                     self.change_queue(new_status="PENDING_ENTRANCE", old_queue=None, new_queue=entrance_queue)
 
         elif self.status == "PENDING_ENTRANCE":
-            if self.can_change_queue(entrance_queue, id_queue, id_capacity):
+            if self.ha_llegado() and self.can_change_queue(entrance_queue, id_queue, id_capacity):
                 self.change_queue(new_status="PENDING_VERIFICATION", old_queue=entrance_queue, new_queue=id_queue)
 
         elif self.status == "PENDING_VERIFICATION":
-            if self.revisado and self.can_change_queue(id_queue, booth_queue, booth_capacity):
+            if self.revisado and self.ha_llegado() and self.can_change_queue(id_queue, booth_queue, booth_capacity):
                 self.revisado = False
                 self.change_queue(new_status="PENDING_VOTE", old_queue=id_queue, new_queue=booth_queue)
 
         elif self.status == "PENDING_VOTE":
-            if self.can_change_queue(booth_queue, voting_booth, voting_capacity):
+            if self.ha_llegado() and self.can_change_queue(booth_queue, voting_booth, voting_capacity):
                 self.change_queue(new_status="VOTING", old_queue=booth_queue, new_queue=voting_booth)
                 # Disparamos el tiempo inmediatamente al entrar a la mampara
                 wait = self.calculate_voting_time()
@@ -386,16 +734,17 @@ class AgenteVotante(mesa.Agent):
             pass
 
         elif self.status == "VOTED":
-            if self.can_change_queue(voting_booth, ballot_queue, ballot_capacity):
+            if self.ha_llegado() and self.can_change_queue(voting_booth, ballot_queue, ballot_capacity):
                 self.change_queue(new_status="PENDING_BALLOT", old_queue=voting_booth, new_queue=ballot_queue)
 
         elif self.status == "PENDING_BALLOT":
             # Pasa directamente a salida, evitando candados de urna
-            if self.can_change_queue(ballot_queue, exit_queue, exit_capacity):
+            if self.ha_llegado() and self.can_change_queue(ballot_queue, exit_queue, exit_capacity):
                 self.change_queue(new_status="PENDING_EXIT", old_queue=ballot_queue, new_queue=exit_queue)
 
         elif self.status == "PENDING_EXIT":
-            self.change_queue(new_status="EXITING", old_queue=exit_queue)
+            if self.ha_llegado():
+                self.change_queue(new_status="EXITING", old_queue=exit_queue)
 
 
 class AgenteFuncionario(mesa.Agent):
@@ -439,7 +788,90 @@ class AgentePresidente(mesa.Agent):
         x, y = self.pos if self.pos is not None else (None, None)
         return {"id": self.unique_id, "tipo": "presidente", "x": x, "y": y}
 
+    def liderar_evacuacion(self):
+        """Cuando ocurre el evento extraordinario, el presidente deja su
+        posicion fija y se convierte en un "faro": avanza un paso por tick
+        hacia la zona segura del tablero. El resto de los agentes presentes
+        (los votantes, ver AgenteVotante._reaccionar_a_evento_extraordinario
+        y ModeloCasilla.get_agent_position) toman su posicion como objetivo
+        en cada tick, por lo que terminan siguiendolo hacia la seguridad."""
+        if self.pos is None or self.pos == self.model.zona_segura:
+            return
+
+        x, y = self.pos
+        tx, ty = self.model.zona_segura
+        dx = (tx > x) - (tx < x)
+        dy = (ty > y) - (ty < y)
+        destino = (x + dx, y + dy)
+
+        if self.model.grid.is_cell_empty(destino):
+            self.model.grid.remove_agent(self)
+            self.model.grid.place_agent(self, destino)
+            return
+
+        # El camino esta ocupado. Si quien lo bloquea es un votante que lo
+        # esta siguiendo, no se espera: se intercambian de lugar (el
+        # seguidor pasa a ocupar la celda que el presidente deja libre).
+        # Sin esto, un seguidor justo delante del presidente y el propio
+        # presidente quedarian esperandose mutuamente para siempre (cada
+        # uno es, a su vez, el objetivo de movimiento del otro; la deteccion
+        # generica de ciclos de ModeloCasilla._mover_votantes_un_paso no
+        # incluye al presidente, ya que el se mueve por su cuenta aqui).
+        (ocupante,) = self.model.grid.get_cell_list_contents([destino]) or (None,)
+        if isinstance(ocupante, AgenteVotante) and ocupante.status == "EN_EVACUACION":
+            origen = self.pos
+            self.model.grid.remove_agent(self)
+            self.model.grid.remove_agent(ocupante)
+            self.model.grid.place_agent(self, destino)
+            self.model.grid.place_agent(ocupante, origen)
+        # si es un funcionario u otro elemento fijo, se espera sin romper la formacion
+
+    def _verificar_evacuacion_completa(self):
+        """Determina si la evacuacion ya termino, para poder cerrar la
+        simulacion en lugar de quedarse en un bucle infinito una vez que el
+        evento extraordinario esta activo (la logica normal de cierre y
+        finalizacion queda en pausa mientras dura la emergencia, ver step).
+        Se considera completa cuando el presidente (el "faro") llega a la
+        zona segura y, ademas, transcurre un margen de ticks -del tamano del
+        tablero- para dar tiempo a que los votantes que lo siguen alcancen a
+        agruparse junto a el. Como red de seguridad adicional (por si algun
+        bloqueo residual impidiera la llegada), tambien se fuerza el cierre
+        pasado un tiempo maximo desde que ocurrio el sismo."""
+        margen_maximo = 5 * self.model.board_size
+        if (self.model.tick_evento_extraordinario is not None
+                and self.model.tick >= self.model.tick_evento_extraordinario + margen_maximo):
+            self.model.finalizada = True
+            self.model.running = False
+            if self.model.verbose:
+                print(f"Evacuacion forzada a terminar en el tiempo {self.model.tick} "
+                      f"(tiempo maximo de emergencia alcanzado).")
+            return
+
+        if self.pos != self.model.zona_segura:
+            return
+
+        if self.model.tick_llegada_zona_segura is None:
+            self.model.tick_llegada_zona_segura = self.model.tick
+            return
+
+        margen = self.model.board_size
+        if self.model.tick >= self.model.tick_llegada_zona_segura + margen:
+            self.model.finalizada = True
+            self.model.running = False
+            if self.model.verbose:
+                print(f"Evacuacion completada en el tiempo {self.model.tick}: "
+                      f"el presidente llevo a todos los presentes a la zona segura.")
+
     def step(self):
+        if self.model.evento_extraordinario:
+            # Durante el evento extraordinario el presidente se dedica por
+            # completo a liderar la evacuacion; la logica normal de cierre
+            # de casilla y finalizacion (mas abajo) queda en pausa mientras
+            # dure la emergencia.
+            self.liderar_evacuacion()
+            self._verificar_evacuacion_completa()
+            return
+
         if self.model.casilla_abierta and self.model.tick >= self.model.hora_cierre:
             self.model.casilla_abierta = False
             print(f"El presidente cierra la entrada en el tiempo {self.model.tick}")
