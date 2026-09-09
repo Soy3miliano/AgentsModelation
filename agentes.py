@@ -8,6 +8,11 @@ ESTATUS_EN_PROCESO = (
     "VOTING", "VOTED", "PENDING_BALLOT", "PENDING_EXIT", "EXITING",
 )
 
+# Umbral de edad (anios) a partir del cual un votante se considera "adulto
+# mayor" para efectos de prioridad en fila (igual que en una casilla real:
+# adultos mayores y personas con discapacidad votan sin hacer fila).
+UMBRAL_ADULTO_MAYOR = 60
+
 
 class ModeloCasilla(mesa.Model):
     def __init__(
@@ -47,6 +52,7 @@ class ModeloCasilla(mesa.Model):
         ideologia_sigma=1.0,
         beta=None,
         prob_terremoto=0.0005,
+        prob_discapacidad=0.06,
     ):
         super().__init__(rng=rng)
         self.num_agentes = n
@@ -68,6 +74,13 @@ class ModeloCasilla(mesa.Model):
         self.tick_evento_extraordinario = None
         self.zona_segura = (board_size // 2, board_size // 2)
         self.tick_llegada_zona_segura = None
+
+        # --- Prioridad en fila (adultos mayores y personas con discapacidad) ---
+        # Probabilidad de que un votante tenga alguna discapacidad (ensayo
+        # Bernoulli independiente de la edad). Ser adulto mayor se deriva
+        # directamente de la edad ya muestreada (ver UMBRAL_ADULTO_MAYOR),
+        # asi que no necesita su propio parametro de probabilidad.
+        self.prob_discapacidad = prob_discapacidad
 
         self.tasa_llegada = tasa_llegada
         self.edad_media = edad_media
@@ -562,11 +575,25 @@ class AgenteVotante(mesa.Agent):
 
         self.ideologia = rng.normal(0, self.model.ideologia_sigma)
 
+        # --- Prioridad en fila ---
+        # Los adultos mayores (umbral por edad) y las personas con
+        # discapacidad (ensayo Bernoulli) tienen prioridad: se les exime del
+        # limite de cupo de cada fila y se colocan al frente de ellas (ver
+        # can_change_queue / change_queue), por lo que en la practica se
+        # "saltan la fila" para llegar directo con el funcionario y a votar.
+        self.es_adulto_mayor = self.edad >= UMBRAL_ADULTO_MAYOR
+        self.tiene_discapacidad = rng.random() < self.model.prob_discapacidad
+        self.prioridad = self.es_adulto_mayor or self.tiene_discapacidad
+
         self.en_revision = False
         self.revisado = False
         self.voto = None
 
     def can_change_queue(self, old_queue, new_queue, capacity):
+        if self.prioridad:
+            # Adultos mayores y personas con discapacidad tienen prioridad:
+            # no se les aplica el limite de cupo de la siguiente fila.
+            return True
         # Desbloqueado: No importa si es el primero de la cola, solo si hay espacio en la siguiente
         return len(new_queue) < capacity
 
@@ -586,7 +613,16 @@ class AgenteVotante(mesa.Agent):
             old_queue.remove(self)
 
         if new_queue is not None:
-            new_queue.append(self)
+            if self.prioridad:
+                # Prioridad: se coloca al frente de la fila (posicion 0) en
+                # vez de al final. Como get_agent_position asigna la celda
+                # segun el indice del agente dentro de la cola (coords[idx]),
+                # esto lo manda directo a la celda mas cercana a la siguiente
+                # etapa -la del funcionario o la de la mampara-, saltandose
+                # fisicamente a quienes ya estaban formados.
+                new_queue.insert(0, self)
+            else:
+                new_queue.append(self)
 
         self.status = new_status
 
@@ -674,6 +710,7 @@ class AgenteVotante(mesa.Agent):
             "ideologia": round(self.ideologia, 3),
             "x": x,
             "y": y,
+            "prioridad": self.prioridad,
         }
     
     def step(self):
