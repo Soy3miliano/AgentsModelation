@@ -134,6 +134,22 @@ class ModeloCasilla(mesa.Model):
         self._colocar_agentes_fijos()
 
     def _beta_por_defecto(self):
+        """Matriz beta (K x 5) por defecto: una fila por candidato, columnas
+        [intercepto, edad_norm, educacion_norm, ingreso_norm, ideologia].
+
+        Calibrada al contexto real de la casilla simulada (Seccion 1250,
+        Distrito Electoral Federal 09 de Jalisco, Col. Oblatos,
+        Guadalajara) para los 3 bloques politicos que compiten ahi:
+        Movimiento Ciudadano (fuerza dominante en la Zona Metropolitana
+        de Guadalajara), MORENA (base amplia y de menor ingreso, con
+        ventaja estructural adicional en una colonia popular como
+        Oblatos) y PAN-PRI (debilitado en Jalisco frente a su fuerza
+        nacional). Es una lectura razonada del contexto real, NO datos
+        de encuesta oficiales de la seccion 1250 (no existen a ese
+        nivel de granularidad). Ver
+        ../REPORTE-CONTRADICCIONES-MODELO-SIMULACION.md y
+        MODELO_DECISION_VOTO.md para la justificacion completa.
+        """
         num_features = 5
         if len(self.candidatos) == 3:
             return np.array([
@@ -141,6 +157,10 @@ class ModeloCasilla(mesa.Model):
                 [ 0.5,  0.1, -0.2, -0.5, -0.9],
                 [-0.4,  0.5, -0.1,  0.4,  1.0],
             ])
+        print(
+            f"Aviso: no hay beta por defecto para {len(self.candidatos)} candidatos; "
+            "usando perfiles neutros (voto uniforme por diseno). Pase `beta` explicitamente."
+        )
         return np.zeros((len(self.candidatos), num_features))
 
     def _definir_zonas(self):
@@ -349,6 +369,7 @@ class ModeloCasilla(mesa.Model):
                     print(f"Agente {v.unique_id} salió en el tick {self.tick}")
 
     def personas_formadas(self):
+        """Total de votantes haciendo fila en este instante (todas las colas)."""
         return sum(len(q) for q in [self.entrance_queue, self.id_queue, self.priority_queue, self.booth_queue, self.ballot_queue, self.exit_queue])
 
     def step(self):
@@ -385,9 +406,22 @@ class ModeloCasilla(mesa.Model):
         }
 
     def estadisticas_corrida(self):
+        """MODELO D aplicado a UNA corrida: media, desviacion e IC 95 % de las
+        variables de salida, calculados sobre los votantes de esta corrida.
+
+        Ojo con la interpretacion: aqui la unidad de observacion es el VOTANTE
+        (cuanto espero cada persona), no la replica. Para el intervalo de
+        confianza sobre el comportamiento del SISTEMA hay que promediar entre
+        replicas: eso lo hace replicas.py.
+        """
         proporciones = {c: self.resultados[c] / self.votos_emitidos for c in self.candidatos} if self.votos_emitidos > 0 else {}
         return {
             "corrida_unica": True,
+            "nota": (
+                "Resultado de 1 corrida. Los intervalos describen la dispersion "
+                "ENTRE VOTANTES, no entre replicas. Use replicas.py para el IC "
+                "del sistema."
+            ),
             "tiempo_espera": est.media_desv_ic95(self.tiempos_espera),
             "tiempo_en_sistema": est.media_desv_ic95(self.tiempos_en_sistema),
             "longitud_fila": est.media_desv_ic95(self.serie_longitud_fila),
@@ -457,6 +491,11 @@ class AgenteVotante(mesa.Agent):
         return self.pos == self.model.get_agent_position(self)
 
     def vector_caracteristicas(self):
+        """Vector z_i = [1, edad_norm, educacion_norm, ingreso_norm, ideologia]
+        usado por el modelo de utilidad U_ij = beta_j^T z_i. Las variables
+        continuas se normalizan (z-score) con la media/sigma de su
+        distribucion en el modelo, igual que ya se hacia con la edad.
+        """
         m = self.model
         edad_norm = (self.edad - m.edad_media) / m.edad_sigma
         educacion_norm = (self.educacion - m.educacion_media) / m.educacion_sigma
@@ -464,6 +503,15 @@ class AgenteVotante(mesa.Agent):
         return np.array([1.0, edad_norm, educacion_norm, ingreso_norm, self.ideologia])
 
     def probabilidades_voto(self):
+        """Vector de probabilidades p sobre las k opciones de la boleta.
+
+        De donde sale p depende del modo configurado en el modelo:
+
+        - "utilidad": logit multinomial. Cada agente tiene SU PROPIO p,
+          derivado de sus atributos via U_j = beta_j^T z_i + softmax.
+        - "categorico_dirichlet": todos los agentes de la corrida comparten el
+          mismo p, sorteado una sola vez de la Dirichlet (MODELO B).
+        """
         if self.model.modo_voto == "categorico_dirichlet":
             return self.model.p_replica
         utilidades = self.model.beta @ self.vector_caracteristicas()
