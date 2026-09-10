@@ -23,12 +23,16 @@ class ModeloCasilla(mesa.Model):
         tasa_llegada=0.05,
         edad_media=45,
         edad_sigma=15,
-        prob_genero_m=0.5,
+        prop_mujeres=est.PROPORCION_MUJERES_LN,
         review_time_medio=3,
         voting_shape=4.0,
         voting_scale=1.25,
-        prob_candidatos=None,
         modo_voto="utilidad",
+        usar_atributos=True,
+        sortear_p=True,
+        distribucion_edad="lista_nominal",
+        participacion_heterogenea=True,
+        tiempos_por_edad=True,
         escenario="A",
         concentracion_dirichlet=None,
         p_replica=None,
@@ -63,9 +67,18 @@ class ModeloCasilla(mesa.Model):
         # Atributos sociodemográficos y colas
         self.prob_discapacidad = prob_discapacidad
         self.tasa_llegada = tasa_llegada
-        self.edad_media = edad_media
-        self.edad_sigma = edad_sigma
-        self.prob_genero_m = prob_genero_m
+        # Si la edad sale de la lista nominal real, el z-score del modelo de
+        # utilidad tiene que estandarizar con la media y sigma DE ESA
+        # distribucion (46.3 y 19.0), no con los 45 / 15 de la Normal vieja.
+        if distribucion_edad == "lista_nominal":
+            self.edad_media, self.edad_sigma = est.media_sigma_edad()
+        else:
+            self.edad_media = edad_media
+            self.edad_sigma = edad_sigma
+        self.prop_mujeres = prop_mujeres
+        self.distribucion_edad = distribucion_edad
+        self.participacion_heterogenea = participacion_heterogenea
+        self.tiempos_por_edad = tiempos_por_edad
         self.review_time_medio = review_time_medio
         self.voting_shape = voting_shape
         self.voting_scale = voting_scale
@@ -85,15 +98,28 @@ class ModeloCasilla(mesa.Model):
         # Modelos estadísticos de votación
         self.modo_voto = modo_voto
         self.escenario = escenario
+        self.usar_atributos = usar_atributos
+        self.sortear_p = sortear_p
         self.perfil_llegadas = perfil_llegadas
         self.participacion = participacion
 
-        if modo_voto == "categorico_dirichlet":
+        # Los modos que se apoyan en el escenario A/B/C/D usan las 6 categorias
+        # del documento y sortean su p de la Dirichlet una vez por corrida.
+        if modo_voto in ("categorico_dirichlet", "logit_jerarquico"):
             self.candidatos = list(est.CATEGORIAS_VOTO)
             self.alphas_dirichlet = est.alphas_escenario(
                 escenario, concentracion_dirichlet or est.CONCENTRACION_DIRICHLET
             )
-            self.p_replica = np.asarray(p_replica, dtype=float) if p_replica is not None else est.muestrear_dirichlet(self.alphas_dirichlet, self.rng)
+            # `sortear_p` es el interruptor del MODELO B. Apagado, la casilla
+            # corre sobre el vector medio del escenario en vez de sortear uno:
+            # sirve para ensenar cuanta de la dispersion entre replicas viene
+            # de la Dirichlet y cuanta del azar de quien vota que.
+            if p_replica is not None:
+                self.p_replica = np.asarray(p_replica, dtype=float)
+            elif sortear_p:
+                self.p_replica = est.muestrear_dirichlet(self.alphas_dirichlet, self.rng)
+            else:
+                self.p_replica = est.vector_escenario(escenario)
         else:
             self.candidatos = candidatos or ["Movimiento Ciudadano", "MORENA", "PAN-PRI"]
             self.alphas_dirichlet = None
@@ -103,10 +129,17 @@ class ModeloCasilla(mesa.Model):
             self.beta = np.array(beta)
         elif self.modo_voto == "utilidad":
             self.beta = self._beta_por_defecto()
+        elif self.modo_voto == "logit_jerarquico":
+            self.beta = self._beta_jerarquica()
+            # Interruptor del componente individual. Con los coeficientes de
+            # atributos en cero, el modelo colapsa EXACTAMENTE al categorico
+            # puro: todo votante recibe softmax(log p) = p. Verificado con
+            # diferencia 0.0e+00, no aproximada.
+            if not usar_atributos:
+                self.beta[:, 1:] = 0.0
         else:
             self.beta = None
 
-        self.prob_candidatos = prob_candidatos or [1 / len(self.candidatos)] * len(self.candidatos)
         self.resultados = {c: 0 for c in self.candidatos}
         self.votos_emitidos = 0
 
@@ -132,6 +165,52 @@ class ModeloCasilla(mesa.Model):
         self.funcionarios = AgenteFuncionario.create_agents(model=self, n=num_funcionarios)
         self.presidente = AgentePresidente.create_agents(model=self, n=1)[0]
         self._colocar_agentes_fijos()
+
+    def _beta_jerarquica(self):
+        """MODELO HIBRIDO: logit multinomial con intercepto jerarquico.
+
+        Junta los dos modelos que hasta ahora se excluian, en vez de obligar a
+        elegir uno:
+
+            U_ij = log(p_j^replica) + beta_j^T z_i        con  p^replica ~ Dirichlet(alpha_escenario)
+
+        El intercepto de cada bloque es el logaritmo de la probabilidad que la
+        Dirichlet sorteo para ESTA corrida, y los atributos del votante lo
+        desvian de ahi. Tiene tres propiedades que ninguno de los dos modelos
+        sueltos tiene a la vez:
+
+          1. Un votante de atributos promedio (z = 0) reproduce EXACTAMENTE el
+             vector del escenario, porque softmax(log p) = p. El agregado queda
+             anclado a la tabla 17 / 18 del documento.
+          2. La incertidumbre sobre el reparto real de la casilla sigue estando
+             donde debe: entre replicas, via la Dirichlet (modelo B).
+          3. El voto vuelve a depender de QUIEN es cada quien (modelo de
+             utilidad), que es la razon de ser de un modelo basado en agentes.
+             Con la Dirichlet sola, los agentes son decoracion: el resultado se
+             podria calcular en forma cerrada sin simular a nadie.
+
+        Las tres categorias menores (otros, nulo, no registrada) llevan
+        coeficientes CERO a proposito: no hay dato publicado sobre su perfil
+        demografico, asi que se dejan gobernadas solo por el escenario en vez
+        de inventarles una plataforma.
+        """
+        # Columnas: [intercepto, edad_norm, educacion_norm, ingreso_norm, ideologia].
+        # El intercepto se sobreescribe con log(p_replica); las demas columnas
+        # reusan los perfiles razonados de _beta_por_defecto para los tres
+        # bloques que si tienen uno.
+        perfiles = {
+            "Morena-PT-PVEM":            [ 0.1, -0.2, -0.5, -0.9],
+            "PAN-PRI":                   [ 0.5, -0.1,  0.4,  1.0],
+            "Movimiento Ciudadano":      [-0.1,  0.3,  0.4,  0.1],
+            "Otros/partidos nuevos":     [ 0.0,  0.0,  0.0,  0.0],
+            "Voto nulo":                 [ 0.0,  0.0,  0.0,  0.0],
+            "Candidatura no registrada": [ 0.0,  0.0,  0.0,  0.0],
+        }
+        p = np.maximum(np.asarray(self.p_replica, dtype=float), 1e-12)
+        filas = []
+        for j, nombre in enumerate(self.candidatos):
+            filas.append([float(np.log(p[j]))] + perfiles.get(nombre, [0.0, 0.0, 0.0, 0.0]))
+        return np.array(filas)
 
     def _beta_por_defecto(self):
         """Matriz beta (K x 5) por defecto: una fila por candidato, columnas
@@ -233,18 +312,35 @@ class ModeloCasilla(mesa.Model):
         if self.evento_extraordinario or self.finalizada:
             return
         if self.rng.random() < self.prob_terremoto:
-            self.evento_extraordinario = True
-            self.tick_evento_extraordinario = self.tick
-            self.casilla_abierta = False
-            self.entrance_queue.clear()
-            self.id_queue.clear()
-            self.priority_queue.clear()
-            self.booth_queue.clear()
-            self.voting_booth.clear()
-            self.ballot_queue.clear()
-            self.exit_queue.clear()
-            if self.verbose:
-                print(f"¡SISMO EN EL TICK {self.tick}! Evacuando con el presidente.")
+            self.forzar_evento_extraordinario()
+
+    def forzar_evento_extraordinario(self):
+        """Dispara el sismo ahora mismo, sin esperar al sorteo de prob_terremoto.
+
+        Con la probabilidad por defecto (0.0005 por tick) el evento aparece en
+        ~14 % de las jornadas de 600 minutos: se puede correr la simulacion
+        decenas de veces sin verlo nunca. Este metodo existe para poder
+        DEMOSTRAR la evacuacion a voluntad; el sorteo aleatorio sigue siendo el
+        mecanismo del modelo y no se toca.
+
+        Devuelve False si ya habia ocurrido o si la jornada ya termino.
+        """
+        if self.evento_extraordinario or self.finalizada:
+            return False
+
+        self.evento_extraordinario = True
+        self.tick_evento_extraordinario = self.tick
+        self.casilla_abierta = False
+        self.entrance_queue.clear()
+        self.id_queue.clear()
+        self.priority_queue.clear()
+        self.booth_queue.clear()
+        self.voting_booth.clear()
+        self.ballot_queue.clear()
+        self.exit_queue.clear()
+        if self.verbose:
+            print(f"¡SISMO EN EL TICK {self.tick}! Evacuando con el presidente.")
+        return True
 
     def get_agent_position(self, agente):
         if isinstance(agente, (AgenteFuncionario, AgentePresidente)):
@@ -415,6 +511,8 @@ class ModeloCasilla(mesa.Model):
         replicas: eso lo hace replicas.py.
         """
         proporciones = {c: self.resultados[c] / self.votos_emitidos for c in self.candidatos} if self.votos_emitidos > 0 else {}
+        acudieron = len([a for a in self.agents
+                         if isinstance(a, AgenteVotante) and a.acude_a_votar])
         return {
             "corrida_unica": True,
             "nota": (
@@ -428,8 +526,23 @@ class ModeloCasilla(mesa.Model):
             "longitud_max_fila": self.longitud_max_fila,
             "proporcion_voto": proporciones,
             "votos_emitidos": self.votos_emitidos,
-            "participacion_observada": (self.votos_emitidos / self.num_agentes if self.num_agentes else 0.0),
             "p_replica": list(self.p_replica) if self.p_replica is not None else None,
+
+            # Descomposicion del embudo. Antes se reportaba un solo numero
+            # (votos / lista nominal) llamado "participacion observada", y con
+            # la casilla saturada daba 24 % contra el 61 % del documento: se
+            # leia como si el modelo estuviera mal calibrado cuando en realidad
+            # estaba midiendo otra cosa. Son tres preguntas distintas:
+            #   cuantos QUISIERON votar, cuantos ALCANZARON, cuantos se quedaron.
+            "lista_nominal": self.num_agentes,
+            "acudieron": acudieron,
+            "participacion_potencial": (acudieron / self.num_agentes) if self.num_agentes else 0.0,
+            "tasa_atencion": (self.votos_emitidos / acudieron) if acudieron else 0.0,
+            "no_alcanzaron": max(0, acudieron - self.votos_emitidos),
+            "participacion_efectiva": (self.votos_emitidos / self.num_agentes) if self.num_agentes else 0.0,
+
+            # Se conserva el nombre viejo como alias para no romper consumidores.
+            "participacion_observada": (self.votos_emitidos / self.num_agentes) if self.num_agentes else 0.0,
         }
 
 
@@ -444,17 +557,35 @@ class AgenteVotante(mesa.Agent):
         else:
             self.tiempo_llegada = est.muestrear_tiempo_llegada_homogeneo(rng, self.model.tasa_llegada)
 
-        self.acude_a_votar = rng.random() < self.model.participacion
         self.tick_entrada = None
         self.tick_salida = None
 
-        while True:
-            edad = int(round(rng.normal(self.model.edad_media, self.model.edad_sigma)))
-            if 18 <= edad <= 90:
-                self.edad = edad
-                break
+        # Edad: por defecto, la estructura REAL de la lista nominal de
+        # Guadalajara (documento, tabla 20). La Normal(45, 15) que se usaba
+        # antes acierta la media pero genera la mitad de adultos mayores de los
+        # que hay: 9 % de 65+ contra 17.7 % reales. Se conserva como
+        # "normal" para poder contrastar las dos.
+        if self.model.distribucion_edad == "lista_nominal":
+            self.edad = est.muestrear_edad(rng)
+        else:
+            while True:
+                edad = int(round(rng.normal(self.model.edad_media, self.model.edad_sigma)))
+                if 18 <= edad <= 90:
+                    self.edad = edad
+                    break
 
-        self.genero = "M" if rng.random() < self.model.prob_genero_m else "F"
+        self.genero = "mujer" if rng.random() < self.model.prop_mujeres else "hombre"
+
+        # Participacion individual, no una Bernoulli plana para todos: el INE
+        # documenta 64.3 % en mujeres contra 54.8 % en hombres, y participacion
+        # creciente con la edad. Agregado sobre la lista nominal sigue dando el
+        # 61 % del documento; lo que cambia es QUIEN acude.
+        if self.model.participacion_heterogenea:
+            p_i = est.probabilidad_participacion(self.edad, self.genero,
+                                                 base=self.model.participacion)
+        else:
+            p_i = self.model.participacion
+        self.acude_a_votar = rng.random() < p_i
         self.educacion = int(rng.choice([0, 1, 2, 3], p=self.model.prob_educacion))
         while True:
             ingreso = rng.normal(self.model.ingreso_media, self.model.ingreso_sigma)
@@ -539,7 +670,14 @@ class AgenteVotante(mesa.Agent):
         self.status = "EN_EVACUACION"
 
     def calculate_voting_time(self):
-        return max(1, int(round(self.model.rng.gamma(self.model.voting_shape, self.model.voting_scale))))
+        """Minutos marcando la boleta. La Gamma es del modelo; el factor por
+        edad es un SUPUESTO explicito (est.PENDIENTE_TIEMPO_POR_EDAD): el
+        documento afirma que el grupo de 65+ requiere mas tiempo de atencion
+        pero no publica un numero. Se apaga con tiempos_por_edad=False."""
+        base = self.model.rng.gamma(self.model.voting_shape, self.model.voting_scale)
+        if self.model.tiempos_por_edad:
+            base *= est.factor_tiempo_por_edad(self.edad)
+        return max(1, int(round(base)))
 
     def to_dict(self):
         x, y = self.pos if self.pos is not None else (None, None)
@@ -636,7 +774,11 @@ class AgenteFuncionario(mesa.Agent):
 
     def review_id(self, votante):
         votante.en_revision = True
-        duracion = max(1, int(round(self.model.rng.exponential(self.model.review_time_medio))))
+        # Revision de credencial: mismo criterio que el tiempo de voto.
+        media_revision = self.model.review_time_medio
+        if self.model.tiempos_por_edad:
+            media_revision *= est.factor_tiempo_por_edad(votante.edad)
+        duracion = max(1, int(round(self.model.rng.exponential(media_revision))))
         self.model.schedule_event(lambda: self._completar_revision(votante), after=duracion)
 
     @staticmethod
