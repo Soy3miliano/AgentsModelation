@@ -4,7 +4,7 @@ import time
 from flask import Flask, jsonify, request
 
 import estadistica as est
-from agentes import ModeloCasilla
+from agentes import ModeloCasilla, AgenteVotante
 
 app = Flask(__name__)
  
@@ -24,8 +24,20 @@ config_default = {
     # "utilidad" para no alterar lo que Unity ya pinta (3 bloques). Para el
     # modelo Categorico + Dirichlet de 6 categorias basta un POST a
     # /api/simulacion/reset con {"modo_voto": "categorico_dirichlet"}.
-    "modo_voto": "utilidad",
+    # Un solo modelo, con sus dos ingredientes conmutables. El jerarquico
+    # contiene a los otros dos: con usar_atributos=False es exactamente el
+    # categorico-Dirichlet, y con sortear_p=False es el clima politico fijo.
+    "modo_voto": "logit_jerarquico",
     "escenario": "A",
+    "usar_atributos": True,
+    "sortear_p": True,
+
+    # Heterogeneidad demografica (documento, seccion 11). Se exponen para poder
+    # apagarlas desde Unity y ensenar el contraste en vivo: con ellas apagadas
+    # el modelo vuelve a la Normal(45,15) inventada y a la Bernoulli plana.
+    "distribucion_edad": "lista_nominal",   # o "normal"
+    "participacion_heterogenea": True,
+    "tiempos_por_edad": True,
     "perfil_llegadas": "nhpp",
     "participacion": est.PARTICIPACION_BASE,
 
@@ -90,6 +102,10 @@ def tablero():
             "simulacion_activa": simulacion_activa,
             "casilla_abierta": casilla.casilla_abierta,
             "finalizada": casilla.finalizada,
+            # Sin esto Unity solo podia inferir el sismo de casilla_abierta,
+            # que tambien es False al cerrar por hora: no se distinguian.
+            "evento_extraordinario": casilla.evento_extraordinario,
+            "tick_evento": casilla.tick_evento_extraordinario,
             "agentes": _todos_los_agentes(),
         }), 200
 
@@ -165,6 +181,25 @@ def cambiar_velocidad():
     return jsonify({"segundos_por_paso": velocidad_tick}), 200
 
 
+@app.route('/api/simulacion/sismo', methods=['POST'])
+def provocar_sismo():
+    """Fuerza el evento extraordinario en el tick actual.
+
+    El modelo lo sortea con prob_terremoto (0.0005 por tick), que en una jornada
+    de 600 minutos sale ~14 % de las veces: sin este endpoint la evacuacion es
+    casi imposible de ensenar en vivo.
+    """
+    with lock:
+        ocurrio = casilla.forzar_evento_extraordinario()
+        return jsonify({
+            "sismo": casilla.evento_extraordinario,
+            "tick": casilla.tick_evento_extraordinario,
+            "disparado_ahora": ocurrio,
+            "motivo": None if ocurrio else (
+                "la jornada ya termino" if casilla.finalizada else "el sismo ya habia ocurrido"),
+        }), 200
+
+
 @app.route('/api/simulacion/reset', methods=['POST'])
 def reset_simulacion():
     """Reinicia la simulacion desde cero. Body JSON opcional para configurarla, ej:
@@ -207,14 +242,26 @@ def estadisticas():
             "en_vivo": {
                 "minuto_jornada": casilla.tick,
                 "duracion_jornada": casilla.hora_cierre,
+                # Config REALMENTE en uso, para que Unity confirme en pantalla
+                # con que parametros corre la casilla y no con los que quedaron
+                # en los sliders sin aplicar.
+                "lista_nominal": casilla.num_agentes,
+                "mamparas": casilla.voting_booth_capacity,
+                "segundos_por_paso": velocidad_tick,
                 "votantes_atendidos": casilla.votos_emitidos,
                 "personas_formadas": casilla.personas_formadas(),
                 "longitud_max_fila": casilla.longitud_max_fila,
                 "casilla_abierta": casilla.casilla_abierta,
                 "simulacion_activa": simulacion_activa,
+                "evento_extraordinario": casilla.evento_extraordinario,
+                "tick_evento": casilla.tick_evento_extraordinario,
             },
             "finalizada": casilla.finalizada,
             "modelo": {
+                # Unity pinta una barra por candidato desde que arranca la
+                # jornada, asi que necesita los nombres antes de que el conteo
+                # se revele en /api/resultados (que los oculta hasta el cierre).
+                "candidatos": list(casilla.candidatos),
                 "modo_voto": casilla.modo_voto,
                 "escenario": casilla.escenario,
                 "perfil_llegadas": casilla.perfil_llegadas,
@@ -239,9 +286,109 @@ def escenarios():
             for clave, datos in est.ESCENARIOS.items()
         },
         "categorias_voto": est.CATEGORIAS_VOTO,
-        "modos_voto": ["utilidad", "categorico_dirichlet"],
+        "modos_voto": ["utilidad", "categorico_dirichlet", "logit_jerarquico"],
         "perfiles_llegada": ["nhpp", "homogeneo"],
     }), 200
+
+
+@app.route('/api/series', methods=['GET'])
+def series():
+    """Datos para las graficas de Unity. Una grafica por modelo estadistico,
+    siguiendo la estructura de CONCEPTOS_ESTADISTICOS_IMPLEMENTADOS.md:
+
+      - llegadas -> MODELO C (NHPP): observado contra el perfil teorico.
+      - espera   -> MODELO D (IC 95 %): histograma con su media e intervalo.
+      - edad     -> seccion 11: quien acude, contra quien esta en la lista.
+      - fila     -> el nucleo operativo: la cola a lo largo de la jornada.
+      - embudo   -> saturacion: de la lista nominal a los votos efectivos.
+
+    Todo se calcula al vuelo del estado actual; no hay serie nueva que guardar.
+    """
+    with lock:
+        votantes = [a for a in casilla.agents if isinstance(a, AgenteVotante)]
+        duracion = max(1, casilla.hora_cierre)
+
+        # --- MODELO C: llegadas por tramo contra el NHPP teorico ------------
+        tramos = est.PERFIL_HORARIO_NHPP
+        escala = duracion / float(tramos[-1][1])
+        bordes = [t[0] * escala for t in tramos] + [tramos[-1][1] * escala]
+        observado = [0] * len(tramos)
+        for v in votantes:
+            if not v.acude_a_votar:
+                continue
+            for i in range(len(tramos)):
+                if bordes[i] <= v.tiempo_llegada < bordes[i + 1] or (i == len(tramos) - 1 and v.tiempo_llegada >= bordes[i]):
+                    observado[i] += 1
+                    break
+        total_obs = sum(observado) or 1
+        teorico = [float(w) for w in est.pesos_tramos_nhpp()]
+
+        # --- MODELO D: histograma de esperas --------------------------------
+        esperas = list(casilla.tiempos_espera)
+        ic = est.media_desv_ic95(esperas)
+        n_cajas = 12
+        tope = max(esperas) if esperas else 1
+        ancho = max(1.0, tope / n_cajas)
+        histo = [0] * n_cajas
+        for e in esperas:
+            histo[min(n_cajas - 1, int(e / ancho))] += 1
+
+        # --- Seccion 11: piramide de edad, lista contra quienes acuden ------
+        grupos = est.ESTRUCTURA_EDAD_LN
+        etiquetas = [f"{g[0]}-{g[1]}" if g[1] < 90 else f"{g[0]}+" for g in grupos]
+        en_lista = [0] * len(grupos)
+        acuden = [0] * len(grupos)
+        for v in votantes:
+            for i, (minimo, maximo, _, _) in enumerate(grupos):
+                if minimo <= v.edad <= maximo:
+                    en_lista[i] += 1
+                    if v.acude_a_votar:
+                        acuden[i] += 1
+                    break
+
+        # --- Cola a lo largo de la jornada (submuestreada para dibujar) -----
+        serie = list(casilla.serie_longitud_fila)
+        objetivo = 60
+        if len(serie) > objetivo:
+            paso = len(serie) / objetivo
+            serie = [max(serie[int(i * paso):max(int(i * paso) + 1, int((i + 1) * paso))])
+                     for i in range(objetivo)]
+
+        # --- Embudo de saturacion -------------------------------------------
+        n_acuden = len([v for v in votantes if v.acude_a_votar])
+
+        return jsonify({
+            "llegadas": {
+                "etiquetas": [t[3] for t in tramos],
+                "observado": [o / total_obs for o in observado],
+                "teorico": teorico,
+                "total": total_obs,
+            },
+            "espera": {
+                "conteo": histo,
+                "ancho_caja": ancho,
+                "media": ic["media"],
+                "ic95_inferior": ic["ic95_inferior"],
+                "ic95_superior": ic["ic95_superior"],
+                "n": ic["n"],
+            },
+            "edad": {
+                "etiquetas": etiquetas,
+                "en_lista": en_lista,
+                "acuden": acuden,
+            },
+            "fila": {
+                "serie": serie,
+                "maximo": casilla.longitud_max_fila,
+                "duracion": duracion,
+            },
+            "embudo": {
+                "lista_nominal": casilla.num_agentes,
+                "acudieron": n_acuden,
+                "votaron": casilla.votos_emitidos,
+                "sin_votar": max(0, n_acuden - casilla.votos_emitidos),
+            },
+        }), 200
 
 
 if __name__ == "__main__":
