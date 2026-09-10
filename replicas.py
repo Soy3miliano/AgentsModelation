@@ -180,7 +180,7 @@ def imprimir_reporte(resultado):
         if ic["media"] is None:
             continue
         if ic["n"] > 1:
-            print(f"  {bloque:<28} {ic['media'] * 100:6.2f} % +/- {ic['error_estandar'] * 100:.2f} pp")
+            print(f"  {bloque:<28} {ic['media'] * 100:6.2f} % +/- {ic['margen_error'] * 100:.2f} pp")
         else:
             print(f"  {bloque:<28} {ic['media'] * 100:6.2f} %  (1 corrida, sin IC)")
 
