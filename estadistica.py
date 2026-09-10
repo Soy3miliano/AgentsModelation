@@ -30,6 +30,139 @@ REPLICAS_RECOMENDADAS = 150  # valor de arranque antes del piloto (seccion 6.3)
 
 
 # ---------------------------------------------------------------------------
+# HETEROGENEIDAD DEMOGRAFICA (documento, seccion 11)
+#
+# Hasta antes de esto el modelo sorteaba la edad de una Normal(45, 15) inventada
+# y hacia que todos acudieran a votar con la misma Bernoulli(0.61). El documento
+# tiene datos mejores y ya publicados, y no usarlos era el hueco mas grande
+# entre lo que dice el reporte y lo que hace el codigo.
+# ---------------------------------------------------------------------------
+
+# Tabla 20: estructura de edad REAL de la Lista Nominal de Guadalajara
+# (DERFE-INE, enero de 2026). Cada entrada: (edad_min, edad_max, electores,
+# multiplicador_participacion).
+#
+# Los conteos de electores son DATO oficial. El multiplicador es SUPUESTO de
+# modelacion del documento, calibrado para reproducir el patron que si publica
+# el INE: participacion creciente con la edad hasta los 79, maxima en 65-74.
+ESTRUCTURA_EDAD_LN = [
+    (18, 24, 157757, 0.88),
+    (25, 29, 124229, 0.82),
+    (30, 34, 125623, 0.85),
+    (35, 39, 118888, 0.90),
+    (40, 44, 109383, 0.97),
+    (45, 49,  99838, 1.03),
+    (50, 54, 101067, 1.08),
+    (55, 59,  91994, 1.13),
+    (60, 64,  82690, 1.18),
+    (65, 90, 217191, 1.15),
+]
+
+# Seccion 11.1: brecha de participacion por sexo (INE, Estudio Muestral de
+# Participacion Ciudadana 2024). Es DATO, no supuesto.
+PARTICIPACION_MUJERES = 0.643
+PARTICIPACION_HOMBRES = 0.548
+
+# Composicion de la Lista Nominal de Guadalajara (DERFE-INE, enero de 2026).
+PROPORCION_MUJERES_LN = 0.520
+
+# Supuesto explicito: el tiempo de atencion crece con la edad. El documento lo
+# afirma cualitativamente (seccion 11.2: el grupo de 65+ "requiere mas tiempo de
+# atencion en la mesa directiva") pero no publica un factor numerico, asi que
+# este es el unico parametro de este bloque que NO viene del documento. Se deja
+# aislado y configurable para poder apagarlo o recalibrarlo.
+PENDIENTE_TIEMPO_POR_EDAD = 0.010   # +1 % de tiempo por cada ano sobre la media
+EDAD_REFERENCIA_TIEMPO = 45         # edad a la que el factor vale 1.0
+FACTOR_TIEMPO_MIN, FACTOR_TIEMPO_MAX = 0.85, 1.50
+
+
+def _pesos_edad():
+    total = sum(t[2] for t in ESTRUCTURA_EDAD_LN)
+    return np.array([t[2] / total for t in ESTRUCTURA_EDAD_LN], dtype=float)
+
+
+def muestrear_edad(rng):
+    """Sortea la edad de un elector segun la estructura real de la Lista Nominal.
+
+    Dos pasos: se elige el grupo quinquenal con probabilidad proporcional a sus
+    electores, y dentro del grupo se toma un ano uniforme. Es el mismo esquema
+    exacto del NHPP (elegir tramo, luego uniforme dentro del tramo).
+
+    Importa mas de lo que parece: la Normal(45, 15) que se usaba antes acierta
+    la media (46 anos) pero se queda corta en la cola larga. Genera 9.3 % de
+    personas de 65 o mas cuando la lista nominal real tiene 17.7 %, y 16 % de
+    60 o mas contra 24 % reales. Como el paso preferente se activa a los 60,
+    la fila prioritaria se ejercitaba la mitad de lo que deberia.
+    """
+    i = int(rng.choice(len(ESTRUCTURA_EDAD_LN), p=_pesos_edad()))
+    minimo, maximo, _, _ = ESTRUCTURA_EDAD_LN[i]
+    return int(rng.integers(minimo, maximo + 1))
+
+
+def media_sigma_edad():
+    """Media y desviacion teoricas de la estructura de edad de la lista nominal.
+
+    El modelo de utilidad estandariza la edad con (edad - media) / sigma. Si se
+    dejaran los 45 / 15 de la Normal vieja, el z-score quedaria descentrado
+    respecto a la distribucion que de verdad se esta muestreando.
+    """
+    pesos = _pesos_edad()
+    centros = np.array([(t[0] + t[1]) / 2.0 for t in ESTRUCTURA_EDAD_LN])
+    anchos = np.array([t[1] - t[0] + 1 for t in ESTRUCTURA_EDAD_LN], dtype=float)
+
+    media = float((pesos * centros).sum())
+    # Varianza total = entre grupos + dentro de cada grupo (uniforme discreta).
+    var_entre = float((pesos * (centros - media) ** 2).sum())
+    var_dentro = float((pesos * (anchos ** 2 - 1) / 12.0).sum())
+    return media, float(np.sqrt(var_entre + var_dentro))
+
+
+def multiplicador_edad(edad):
+    """Multiplicador de participacion del grupo de edad al que pertenece `edad`."""
+    for minimo, maximo, _, mult in ESTRUCTURA_EDAD_LN:
+        if minimo <= edad <= maximo:
+            return mult
+    return ESTRUCTURA_EDAD_LN[-1][3] if edad > 90 else ESTRUCTURA_EDAD_LN[0][3]
+
+
+def _multiplicadores_sexo():
+    """Multiplicadores de sexo normalizados a la composicion de la lista nominal.
+
+    Se normalizan para que el promedio ponderado valga exactamente 1: asi la
+    brecha documentada de 9.5 puntos se conserva sin desplazar la participacion
+    global, que sigue anclada en PARTICIPACION_BASE.
+    """
+    pm = PROPORCION_MUJERES_LN
+    promedio = pm * PARTICIPACION_MUJERES + (1 - pm) * PARTICIPACION_HOMBRES
+    return PARTICIPACION_MUJERES / promedio, PARTICIPACION_HOMBRES / promedio
+
+
+def probabilidad_participacion(edad, genero, base=PARTICIPACION_BASE):
+    """Probabilidad de que ESTE elector acuda a votar.
+
+        p_i = base * multiplicador_edad(edad_i) * multiplicador_sexo(genero_i)
+
+    Ambos multiplicadores estan normalizados para que, agregados sobre la
+    estructura real de la lista nominal, devuelvan `base`. O sea: la
+    participacion global sigue siendo la del documento (61 %); lo que cambia es
+    COMO se reparte entre personas, que es justo lo que hace falta para que la
+    casilla se llene de adultos mayores a las horas correctas.
+    """
+    mult_mujer, mult_hombre = _multiplicadores_sexo()
+    mult_sexo = mult_mujer if genero == "mujer" else mult_hombre
+    return float(np.clip(base * multiplicador_edad(edad) * mult_sexo, 0.0, 1.0))
+
+
+def factor_tiempo_por_edad(edad):
+    """Cuanto mas (o menos) tarda una persona de `edad` en ser atendida.
+
+    SUPUESTO explicito, ver PENDIENTE_TIEMPO_POR_EDAD. Vale 1.0 a los 45 anos.
+    """
+    factor = 1.0 + PENDIENTE_TIEMPO_POR_EDAD * (edad - EDAD_REFERENCIA_TIEMPO)
+    return float(np.clip(factor, FACTOR_TIEMPO_MIN, FACTOR_TIEMPO_MAX))
+
+
+# ---------------------------------------------------------------------------
 # MODELO A + B: categorias de voto y vectores de intencion
 # ---------------------------------------------------------------------------
 
@@ -265,8 +398,15 @@ def media_desv_ic95(muestras, z=Z_95):
 
         media    = (1/n) * sum(x_i)
         s        = sqrt( sum((x_i - media)^2) / (n - 1) )      [n-1: insesgada]
-        error    = z * s / sqrt(n)                              [error estandar]
-        IC 95 %  = media +/- error
+        SE       = s / sqrt(n)                                  [error estandar]
+        margen   = z * SE                                       [semiamplitud del IC]
+        IC 95 %  = media +/- margen
+
+    OJO con los dos nombres: el ERROR ESTANDAR es s/sqrt(n) y el MARGEN DE
+    ERROR es z veces eso (1.96 veces, al 95 %). Hasta antes de esta correccion
+    el campo "error_estandar" contenia en realidad el margen -los intervalos
+    siempre estuvieron bien calculados, pero reportar ese numero como error
+    estandar lo infla por un factor de 1.96-. Se devuelven los dos por separado.
 
     Devuelve un diccionario listo para serializar a JSON (la API de Unity lo
     consume tal cual). Con una sola muestra no existe dispersion: se devuelve
@@ -277,28 +417,30 @@ def media_desv_ic95(muestras, z=Z_95):
 
     if n == 0:
         return {
-            "n": 0, "media": None, "desviacion": None,
-            "error_estandar": None, "ic95_inferior": None, "ic95_superior": None,
+            "n": 0, "media": None, "desviacion": None, "error_estandar": None,
+            "margen_error": None, "ic95_inferior": None, "ic95_superior": None,
         }
 
     media = float(x.mean())
 
     if n == 1:
         return {
-            "n": 1, "media": media, "desviacion": 0.0,
-            "error_estandar": 0.0, "ic95_inferior": media, "ic95_superior": media,
+            "n": 1, "media": media, "desviacion": 0.0, "error_estandar": 0.0,
+            "margen_error": 0.0, "ic95_inferior": media, "ic95_superior": media,
         }
 
-    desviacion = float(x.std(ddof=1))   # ddof=1 -> divide entre n-1
-    error = float(z * desviacion / np.sqrt(n))
+    desviacion = float(x.std(ddof=1))               # ddof=1 -> divide entre n-1
+    error_estandar = float(desviacion / np.sqrt(n))  # SE, la dispersion de la media
+    margen = float(z * error_estandar)               # semiamplitud del IC al 95 %
 
     return {
         "n": int(n),
         "media": media,
         "desviacion": desviacion,
-        "error_estandar": error,
-        "ic95_inferior": media - error,
-        "ic95_superior": media + error,
+        "error_estandar": error_estandar,
+        "margen_error": margen,
+        "ic95_inferior": media - margen,
+        "ic95_superior": media + margen,
     }
 
 
@@ -337,5 +479,5 @@ def formatear_ic(resumen_ic, decimales=2, unidad=""):
     if resumen_ic["n"] == 1:
         return f"{media:.{decimales}f}{sufijo} (1 corrida, sin IC)"
 
-    error = resumen_ic["error_estandar"]
-    return f"{media:.{decimales}f} +/- {error:.{decimales}f}{sufijo} (IC 95 %, n={resumen_ic['n']})"
+    margen = resumen_ic["margen_error"]
+    return f"{media:.{decimales}f} +/- {margen:.{decimales}f}{sufijo} (IC 95 %, n={resumen_ic['n']})"
