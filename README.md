@@ -86,5 +86,3 @@ Assets/           Proyecto Unity: escena, scripts, prefabs de personajes y mobil
   `UserSettings/` (ver `.gitignore`): se regeneran al abrir el proyecto.
 - Los `.meta` **sí** van al repo; son los que mantienen las referencias de
   prefabs y escena entre computadoras. No los borres.
-- Hay un `Assets/Scripts/server.py` (copia vieja) colado en el proyecto Unity;
-  Unity lo ignora, se puede borrar en una limpieza aparte.
