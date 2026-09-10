@@ -1,0 +1,5 @@
+# Backend de la simulación (server.py, agentes.py, estadistica.py, replicas.py)
+# Instalar con:  pip install -r requirements.txt
+mesa>=3.5,<4
+numpy>=2.0
+flask>=3.0
