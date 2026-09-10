@@ -64,6 +64,27 @@ public class VotanteAgent : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// Pone al agente a caminar al ritmo del modelo: cruzar una celda le toma
+    /// exactamente lo que dura un tick del backend. Así, al pasar a x10, el
+    /// agente se mueve 10 veces más rápido en vez de quedarse atrás y avanzar
+    /// a saltos persiguiendo un destino que ya cambió.
+    ///
+    /// El 1.15 es un margen: sin él el agente llega justo en el límite y
+    /// cualquier microtirón del frame lo deja corto, lo que se ve como titubeo.
+    /// </summary>
+    /// <param name="tamanoCelda">Unidades de mundo por celda del tablero.</param>
+    /// <param name="segundosPorTick">Cuánto dura un tick del backend.</param>
+    public void AjustarRitmo(float tamanoCelda, float segundosPorTick)
+    {
+        moveSpeed = (tamanoCelda / Mathf.Max(0.01f, segundosPorTick)) * 1.15f;
+        rotationSpeed = 10f / Mathf.Max(0.05f, segundosPorTick);
+
+        // El ciclo de caminado tiene que acelerar igual, o se ve patinando.
+        if (animator != null)
+            animator.speed = Mathf.Clamp(1f / Mathf.Max(0.05f, segundosPorTick), 1f, 10f);
+    }
+
     public void UpdateAgentData(Vector3 newGridPos, string status)
     {
         targetPosition = newGridPos;

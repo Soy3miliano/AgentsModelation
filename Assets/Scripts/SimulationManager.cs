@@ -39,13 +39,24 @@ public class PerfilSimulacion
     [Min(1)] public int horaCierre = 300;
     [Min(1)] public int capacidadMamparas = 2;
 
+    [Tooltip("A/B/C/D: el escenario politico del que parte el modelo.")]
+    public string escenario = "A";
+    [Tooltip("Componente individual del logit jerarquico (beta^T z del votante).")]
+    public bool usarAtributos = true;
+    [Tooltip("Componente agregado: sortear p de la Dirichlet en vez de usar la media.")]
+    public bool sortearP = true;
+
     public string ToJsonBody()
     {
         var ci = CultureInfo.InvariantCulture;
         return "{"
             + "\"n\": " + n.ToString(ci) + ", "
             + "\"hora_cierre\": " + horaCierre.ToString(ci) + ", "
-            + "\"voting_booth_capacity\": " + capacidadMamparas.ToString(ci)
+            + "\"voting_booth_capacity\": " + capacidadMamparas.ToString(ci) + ", "
+            + "\"modo_voto\": \"logit_jerarquico\", "
+            + "\"escenario\": \"" + escenario + "\", "
+            + "\"usar_atributos\": " + (usarAtributos ? "true" : "false") + ", "
+            + "\"sortear_p\": " + (sortearP ? "true" : "false")
             + "}";
     }
 }
@@ -90,16 +101,31 @@ public class SimulationManager : MonoBehaviour
     };
 
     private float timer = 0f;
+    private bool peticionEnVuelo = false;      // impide que los sondeos se encimen
+    private float segundosPorTick = 1f;        // cuánto dura un tick del backend
     private Dictionary<int, VotanteAgent> activeAgents = new Dictionary<int, VotanteAgent>();
     private HashSet<int> tintados = new HashSet<int>();               // ya se les pintó el material
     private Dictionary<int, GameObject> marcadores = new Dictionary<int, GameObject>();
+
+    void Awake()
+    {
+        // "localhost" resuelve primero a ::1 y el backend solo escucha en IPv4,
+        // así que cada conexión desperdiciaba ~2 s esperando el fallback a IPv4
+        // (medido en esta máquina: 2051 ms contra 0.2 ms). Con el sondeo
+        // acelerado eso encolaba decenas de peticiones y el server dev las
+        // cortaba: "Curl error 56: Connection was reset".
+        apiUrl = apiUrl.Replace("localhost", "127.0.0.1");
+        apiBase = apiBase.Replace("localhost", "127.0.0.1");
+    }
 
     void Update()
     {
         timer += Time.deltaTime;
         if (timer >= updateInterval)
         {
-            StartCoroutine(GetSimulationState());
+            // Si la anterior sigue en vuelo se salta este turno. Sin esta guarda,
+            // a x10 se lanzaban 20 peticiones por segundo sin esperar respuesta.
+            if (!peticionEnVuelo) StartCoroutine(GetSimulationState());
             timer = 0f;
         }
 
@@ -127,8 +153,10 @@ public class SimulationManager : MonoBehaviour
 
     private IEnumerator GetSimulationState()
     {
+        peticionEnVuelo = true;
         using (UnityWebRequest request = UnityWebRequest.Get(apiUrl))
         {
+            request.timeout = 5;
             yield return request.SendWebRequest();
 
             if (request.result == UnityWebRequest.Result.Success)
@@ -136,6 +164,7 @@ public class SimulationManager : MonoBehaviour
                 ProcessStepData(request.downloadHandler.text);
             }
         }
+        peticionEnVuelo = false;
     }
 
    private void ProcessStepData(string json)
@@ -175,6 +204,10 @@ public class SimulationManager : MonoBehaviour
                 {
                     script.esFijo = true;
                 }
+
+                // Nace ya con el ritmo de la velocidad actual, si no, los agentes
+                // que aparecen después de acelerar caminarían en cámara lenta.
+                script.AjustarRitmo(gridScale, segundosPorTick);
 
                 activeAgents.Add(agent.id, script);
             }
@@ -300,5 +333,57 @@ public class SimulationManager : MonoBehaviour
                 Debug.LogError($"Reset falló: {request.error} — {request.downloadHandler.text}");
             }
         }
+    }
+
+    // --------------------------------------------------------- API pública ---
+    // La usa ControlesUI para que los botones de la escena hagan exactamente lo
+    // mismo que las teclas, sin duplicar ni la lógica de red ni la
+    // reconstrucción del layout tras un reset.
+
+    /// <summary>Reinicia el backend con una configuración arbitraria.</summary>
+    /// <summary>Devuelve la corrutina para poder esperar a que el reset termine
+    /// antes de abrir la casilla.</summary>
+    public Coroutine ReiniciarCon(int n, int horaCierre, int capacidadMamparas,
+                                  string escenario = "A",
+                                  bool usarAtributos = true, bool sortearP = true)
+    {
+        return StartCoroutine(ResetSimulacion(new PerfilSimulacion
+        {
+            nombre = "Personalizado",
+            n = n,
+            horaCierre = horaCierre,
+            capacidadMamparas = capacidadMamparas,
+            escenario = escenario,
+            usarAtributos = usarAtributos,
+            sortearP = sortearP
+        }));
+    }
+
+    /// <summary>Abre la casilla (equivale a SPACE).</summary>
+    public void Iniciar()
+    {
+        StartCoroutine(IniciarSimulacion());
+    }
+
+    /// <summary>
+    /// Ajusta toda la visualización a la velocidad del backend, como el x2 de un
+    /// reproductor de video: no se saltan fotogramas, todo va más rápido.
+    ///
+    /// Tres cosas tienen que moverse juntas o la escena se ve errática:
+    ///   1. Cada cuánto se pregunta el tablero (un sondeo por tick, con tope de
+    ///      10 Hz para no ahogar al server dev de Flask).
+    ///   2. La velocidad de traslado del agente: tiene que cruzar EXACTAMENTE una
+    ///      celda por tick. Con el moveSpeed fijo de 3 u/s y celdas de 4 u, un
+    ///      agente tardaba 1.33 s en cruzar una celda que el modelo cruza en 1 s;
+    ///      ya iba atrasado en x1 y en x10 nunca alcanzaba su destino.
+    ///   3. La velocidad del Animator, para que el ciclo de caminado acompañe.
+    /// </summary>
+    public void FijarVelocidad(float segundosPorPaso)
+    {
+        segundosPorTick = Mathf.Max(0.01f, segundosPorPaso);
+        updateInterval = Mathf.Clamp(segundosPorTick, 0.1f, 0.5f);
+
+        foreach (VotanteAgent agente in activeAgents.Values)
+            if (agente != null) agente.AjustarRitmo(gridScale, segundosPorTick);
     }
 }
