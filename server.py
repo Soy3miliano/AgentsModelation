@@ -28,6 +28,14 @@ config_default = {
     "escenario": "A",
     "perfil_llegadas": "nhpp",
     "participacion": est.PARTICIPACION_BASE,
+
+    # Evento extraordinario (sismo) y perfil de accesibilidad. Se exponen para
+    # poder forzarlos desde Unity: con el valor por defecto de 0.0005/tick el
+    # sismo aparece en ~14 % de las corridas de 300 ticks, asi que para
+    # DEMOSTRAR la evacuacion conviene un POST a /api/simulacion/reset con
+    # {"prob_terremoto": 0.05} (o 1.0 para dispararlo en el primer tick).
+    "prob_terremoto": 0.0005,
+    "prob_discapacidad": 0.06,
 }
 
 casilla = ModeloCasilla(**config_default)
